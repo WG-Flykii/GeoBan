@@ -1,0 +1,39 @@
+{
+  "name": "streakbot",
+  "version": "1.0.0",
+  "description": "Streakbot for WG",
+  "main": "src/streakbot.js",
+  "type": "module",
+  "scripts": {
+    "test": "npm test",
+    "dev": "nodemon"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WG-Flykii/StreakBot.git"
+  },
+  "keywords": [
+    "discord",
+    "geography",
+    "quiz"
+  ],
+  "author": "Beans",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/WG-Flykii/StreakBot/issues"
+  },
+  "homepage": "https://github.com/WG-Flykii/StreakBot#readme",
+  "dependencies": {
+    "axios": "^1.9.0",
+    "csv-parser": "^3.2.0",
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.5.0",
+    "luxon": "^3.6.1",
+    "papaparse": "^5.5.3",
+    "puppeteer": "^24.9.0",
+    "sharp": "^0.34.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
