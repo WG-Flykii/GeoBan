@@ -449,7 +449,7 @@ client.on('messageCreate', async (message) => {
         : 'Never';
 
       const embed = new EmbedBuilder()
-        .setTitle('📊 Bot Statistics')
+        .setTitle('Stats :')
         .setColor(0x00FF00)
         .addFields([
           { name: 'Total Players Tracked', value: totalPlayers.toString(), inline: true },
