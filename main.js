@@ -12,8 +12,12 @@ const client = new Client({
   ] 
 });
 
-const ALLOWED_CHANNEL_ID = ''; // channel to announce ban updates
-const UNBAN_CHANNEL_ID = ''; // channel to announce unban updates
+const BAN_ROLE_ID = ''; // ping the role to notify people if someone got banned
+const UNBAN_ROLE_ID = ''; // ping the role to notify people if someone got unbanned
+
+const ALLOWED_CHANNEL_ID = ''; // channel to announce when someone got banned
+const UNBAN_CHANNEL_ID = ''; // channel to announce when someone got unbanned
+
 const API_BASE = 'https://www.geoguessr.com/api';
 const NCFA_COOKIE = process.env.GEOGUESSR_COOKIE;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -25,34 +29,165 @@ const HEADERS = {
 };
 
 const PLAYER_TRACKING_FILE = 'player_tracking.json';
-const CHECK_INTERVAL = 2 * 60 * 60 * 1000; // 2 heures
+const BANNED_SUSPENDED_CSV = 'banned_suspended_players.csv';
+const UNBANNED_UNSUSPENDED_CSV = 'unbanned_unsuspended_players.csv';
+const CHECK_INTERVAL = 2 * 60 * 60 * 1000;
 
 let checkInterval;
+let rateLimitCounter = 0;
+let lastRateLimitReset = Date.now();
 
-function makeAPIRequest(url) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(url, { headers: HEADERS }, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP Error: ${res.statusCode}`));
-        return;
-      }
-      
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (error) {
-          reject(new Error('Invalid JSON response'));
-        }
-      });
-    });
+async function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function logRateLimit() {
+  rateLimitCounter++;
+  const now = Date.now();
+  
+  if (now - lastRateLimitReset > 3600000) {
+    console.log(`Rate limit hits in last hour: ${rateLimitCounter}`);
+    rateLimitCounter = 0;
+    lastRateLimitReset = now;
+  }
+}
+
+function initializeCSVFiles() {
+  const bannedSuspendedHeaders = 'Date,Username,UserID,Profile_URL,ELO,Position,Action_Type,Suspended_Until\n';
+  const unbannedUnsuspendedHeaders = 'Date,Username,UserID,Profile_URL,ELO,Position,Previous_Action_Type,Duration_Days\n';
+  
+  if (!fs.existsSync(BANNED_SUSPENDED_CSV)) {
+    fs.writeFileSync(BANNED_SUSPENDED_CSV, bannedSuspendedHeaders, 'utf8');
+  }
+  
+  if (!fs.existsSync(UNBANNED_UNSUSPENDED_CSV)) {
+    fs.writeFileSync(UNBANNED_UNSUSPENDED_CSV, unbannedUnsuspendedHeaders, 'utf8');
+  }
+}
+
+function escapeCSV(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function addToBannedSuspendedCSV(player) {
+  try {
+    const date = new Date().toISOString().split('T')[0];
+    const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
+    const actionType = player.confirmedBanned ? 'BANNED' : 'SUSPENDED';
+    const suspendedUntil = player.suspended && player.suspendedUntil ? 
+      new Date(player.suspendedUntil).toISOString().split('T')[0] : '';
     
-    request.on('error', reject);
-    request.setTimeout(10000, () => {
-      request.destroy();
-      reject(new Error('Request timeout'));
-    });
+    const csvLine = [
+      escapeCSV(date),
+      escapeCSV(player.nick),
+      escapeCSV(player.userId),
+      escapeCSV(profileUrl),
+      escapeCSV(player.lastRating.rating),
+      escapeCSV(player.lastRating.position),
+      escapeCSV(actionType),
+      escapeCSV(suspendedUntil)
+    ].join(',') + '\n';
+    
+    fs.appendFileSync(BANNED_SUSPENDED_CSV, csvLine, 'utf8');
+    console.log(`Added to banned/suspended CSV: ${player.nick} (${actionType})`);
+  } catch (error) {
+    console.error('Error adding to banned/suspended CSV:', error);
+  }
+}
+
+function addToUnbannedUnsuspendedCSV(player, playerData) {
+  try {
+    const date = new Date().toISOString().split('T')[0];
+    const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
+    
+    const previousActionType = playerData.status === 'banned' ? 'BANNED' : 'SUSPENDED';
+    const actionDuration = playerData.bannedAt || playerData.suspendedAt ? 
+      Math.floor((Date.now() - (playerData.bannedAt || playerData.suspendedAt)) / (24 * 60 * 60 * 1000)) : 0;
+    
+    const csvLine = [
+      escapeCSV(date),
+      escapeCSV(player.nick),
+      escapeCSV(player.userId),
+      escapeCSV(profileUrl),
+      escapeCSV(player.rating),
+      escapeCSV(player.position),
+      escapeCSV(previousActionType),
+      escapeCSV(actionDuration)
+    ].join(',') + '\n';
+    
+    fs.appendFileSync(UNBANNED_UNSUSPENDED_CSV, csvLine, 'utf8');
+    console.log(`Added to unbanned/unsuspended CSV: ${player.nick} (${previousActionType} - ${actionDuration} days)`);
+  } catch (error) {
+    console.error('Error adding to unbanned/unsuspended CSV:', error);
+  }
+}
+
+function makeAPIRequest(url, maxRetries = 2) {
+  return new Promise(async (resolve, reject) => {
+    let lastError;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await new Promise((resolveInner, rejectInner) => {
+          const request = https.get(url, { headers: HEADERS }, (res) => {
+            if (res.statusCode === 429) {
+              logRateLimit();
+              const retryAfter = parseInt(res.headers['retry-after']) || 30;
+              rejectInner(new Error(`Rate limited. Retry after ${retryAfter} seconds`));
+              return;
+            }
+            
+            if (res.statusCode !== 200) {
+              rejectInner(new Error(`HTTP Error: ${res.statusCode}`));
+              return;
+            }
+            
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+              try {
+                resolveInner(JSON.parse(data));
+              } catch (error) {
+                rejectInner(new Error('Invalid JSON response'));
+              }
+            });
+          });
+          
+          request.on('error', rejectInner);
+          request.setTimeout(12000, () => {
+            request.destroy();
+            rejectInner(new Error('Request timeout'));
+          });
+        });
+        
+        return resolve(result);
+        
+      } catch (error) {
+        lastError = error;
+        
+        if (attempt < maxRetries) {
+          let waitTime = 1000;
+          
+          if (error.message.includes('Rate limited')) {
+            waitTime = error.message.includes('Retry after') ? 
+              parseInt(error.message.match(/\d+/)[0]) * 1000 : 
+              Math.min(10000 + (attempt * 5000), 30000);
+          } else {
+            waitTime = 2000 + (attempt * 2000);
+          }
+          
+          console.log(`Attempt ${attempt + 1} failed, waiting ${waitTime/1000}s: ${error.message}`);
+          await delay(waitTime);
+        }
+      }
+    }
+    
+    reject(lastError);
   });
 }
 
@@ -82,24 +217,35 @@ function savePlayerData(data) {
 }
 
 async function fetchCurrentLeaderboard() {
-  console.log('Fetching current leaderboard...');
+  console.log('Fetching top 2000 leaderboard...');
   const allPlayers = [];
   
-  for (let offset = 0; offset < 2000; offset += 100) {
+  for (let offset = 0; offset < 2000; offset += 100) {  // offset < XXXX = top XXXX on the lb only
     const url = `${API_BASE}/v4/ranked-system/ratings?offset=${offset}&limit=100`;
     try {
       const players = await makeAPIRequest(url);
       if (players.length === 0) break;
       
       allPlayers.push(...players);
-      await new Promise(resolve => setTimeout(resolve, 50));
+      
+      if (offset + 100 < 2000) {
+        await delay(75); // check time
+      }
+      
     } catch (error) {
       console.error(`Error fetching leaderboard at offset ${offset}:`, error.message);
+      
+      if (error.message.includes('Rate limited')) {
+        console.log('Rate limited on leaderboard, waiting...');
+        await delay(15000);
+        offset -= 100; // retry la page
+        continue;
+      }
       break;
     }
   }
   
-  console.log(`Fetched ${allPlayers.length} players from leaderboard`);
+  console.log(`Fetched ${allPlayers.length} players from top 2000`);
   return allPlayers;
 }
 
@@ -141,8 +287,92 @@ async function sendStatusMessage(message, isError = false) {
   }
 }
 
+async function verifyBannedPlayers(missingPlayers) {
+  console.log(`Verifying ban status for ${missingPlayers.length} missing players`);
+  const bannedPlayers = [];
+  
+  const BATCH_SIZE = 10;
+  const INTER_BATCH_DELAY = 200;
+  let rateLimitHits = 0;
+  let processedCount = 0;
+  
+  for (let i = 0; i < missingPlayers.length; i += BATCH_SIZE) {
+    const batch = missingPlayers.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i/BATCH_SIZE) + 1;    
+    
+    const promises = batch.map(async (player, index) => {
+      try {
+        if (index > 0) await new Promise(resolve => setTimeout(resolve, 50 * index));
+        
+        const activityData = await getUserActivity(player.userId);
+        processedCount++;
+        
+        if (activityData.banned || activityData.suspended) {
+          const banType = activityData.banned ? 'BANNED' : 'SUSPENDED';
+          const suspensionInfo = activityData.suspended ? 
+            ` until ${new Date(activityData.suspendedUntil).toLocaleString()}` : '';
+          
+          console.log(`${banType}: ${player.nick} (last seen ${player.hoursSinceSeen}h ago)${suspensionInfo} [${processedCount}/${missingPlayers.length}]`);
+          
+          return {
+            ...player,
+            confirmedBanned: activityData.banned,
+            suspended: activityData.suspended,
+            suspendedUntil: activityData.suspendedUntil,
+            lastRating: player.ratings[player.ratings.length - 1]
+          };
+        } else {
+          console.log(`Still active: ${player.nick} (inactivity drop) [${processedCount}/${missingPlayers.length}]`);
+          return null;
+        }
+      } catch (error) {
+        processedCount++;
+        console.log(`Error checking ${player.nick}: ${error.message} [${processedCount}/${missingPlayers.length}]`);
+        
+        if (error.message.includes('Rate limited') || error.message.includes('429')) {
+          rateLimitHits++;
+        }
+        
+        return null;
+      }
+    });
+    
+    const results = await Promise.allSettled(promises);
+    
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value !== null) {
+        bannedPlayers.push(result.value);
+      } else if (result.status === 'rejected') {
+        console.log(`Promise rejected for ${batch[index]?.nick}: ${result.reason}`);
+      }
+    });
+    
+    if (i + BATCH_SIZE < missingPlayers.length) {
+      let delay = INTER_BATCH_DELAY;
+      
+      if (rateLimitHits > 3) {
+        delay = INTER_BATCH_DELAY * 3;
+        console.log(`Rate limit detected, increasing delay to ${delay}ms`);
+      } else if (rateLimitHits > 1) {
+        delay = INTER_BATCH_DELAY * 2;
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
+      
+      if (batchNum % 3 === 0) {
+        rateLimitHits = Math.floor(rateLimitHits / 2);
+      }
+    }
+  }
+  
+  console.log(`Verification completed: ${bannedPlayers.length} confirmed bans/suspensions (${processedCount}/${missingPlayers.length} players checked)`);
+  console.log(`Rate limit hits during verification: ${rateLimitHits}`);
+  return bannedPlayers;
+}
+
 async function checkForBannedPlayers() {
-  console.log(`\n--- Starting automatic check (${new Date().toISOString()}) ---`);
+  const startTime = Date.now();
+  console.log(`\n--- Starting check at ${new Date().toISOString()} ---`);
   
   try {
     const data = loadPlayerData();
@@ -177,6 +407,7 @@ async function checkForBannedPlayers() {
         if (playerData.status === 'banned' || playerData.status === 'suspended') {
           console.log(`UNBANNED/UNSUSPENDED: ${player.nick} is back on leaderboard`);
           await sendUnbanNotification(player, playerData);
+          addToUnbannedUnsuspendedCSV(player, playerData);
           playerData.status = 'active';
           playerData.unbannedAt = currentTime;
         } else {
@@ -196,16 +427,16 @@ async function checkForBannedPlayers() {
     }
     
     const missingPlayers = [];
-    const oneDayAgo = currentTime - (24 * 60 * 60 * 1000);
+    const twelveHoursAgo = currentTime - (12 * 60 * 60 * 1000);
     
     for (const [userId, playerData] of Object.entries(data.players)) {
       if (!currentPlayerIds.has(userId) && 
-          playerData.lastSeen > oneDayAgo && 
+          playerData.lastSeen > twelveHoursAgo && 
           playerData.status === 'active') {
         
         const hoursSinceSeen = Math.floor((currentTime - playerData.lastSeen) / (60 * 60 * 1000));
         
-        if (hoursSinceSeen < 48) {
+        if (hoursSinceSeen >= 2 && hoursSinceSeen < 36) {
           missingPlayers.push({
             userId,
             ...playerData,
@@ -215,7 +446,7 @@ async function checkForBannedPlayers() {
       }
     }
     
-    console.log(`Found ${missingPlayers.length} recently missing players`);
+    console.log(`Found ${missingPlayers.length} recently missing players to verify`);
     
     let actionCount = 0;
     if (missingPlayers.length > 0) {
@@ -226,6 +457,8 @@ async function checkForBannedPlayers() {
         await sendBanNotification(bannedPlayers);
         
         for (const player of bannedPlayers) {
+          addToBannedSuspendedCSV(player);
+          
           if (player.confirmedBanned) {
             data.players[player.userId].status = 'banned';
             data.players[player.userId].bannedAt = currentTime;
@@ -242,63 +475,18 @@ async function checkForBannedPlayers() {
     data.totalChecks = (data.totalChecks || 0) + 1;
     savePlayerData(data);
     
+    const duration = Math.round((Date.now() - startTime) / 1000);
     const statusMessage = actionCount > 0 
-      ? `Check completed successfully. Found ${actionCount} new ban(s)/suspension(s).`
-      : `Check completed successfully. No new bans or suspensions detected.`;
+      ? `Check completed in ${duration}s. Found ${actionCount} new ban(s)/suspension(s).`
+      : `Check completed in ${duration}s. No new bans or suspensions detected.`;
     
     await sendStatusMessage(statusMessage);
-    console.log(`Check completed. Total checks: ${data.totalChecks}`);
+    console.log(`Check completed in ${duration} seconds. Total checks: ${data.totalChecks}`);
     
   } catch (error) {
     console.error('Error during check:', error);
     await sendStatusMessage(`Check failed: ${error.message}`, true);
   }
-}
-
-async function verifyBannedPlayers(missingPlayers) {
-  console.log(`Verifying ban status for ${missingPlayers.length} missing players`);
-  const bannedPlayers = [];
-  
-  const BATCH_SIZE = 10;
-  for (let i = 0; i < missingPlayers.length; i += BATCH_SIZE) {
-    const batch = missingPlayers.slice(i, i + BATCH_SIZE);
-    
-    const promises = batch.map(async (player) => {
-      try {
-        const activityData = await getUserActivity(player.userId);
-        
-        if (activityData.banned || activityData.suspended) {
-          const banType = activityData.banned ? 'BANNED' : 'SUSPENDED';
-          const suspensionInfo = activityData.suspended ? 
-            ` until ${new Date(activityData.suspendedUntil).toLocaleString()}` : '';
-          
-          console.log(`${banType}: ${player.nick} (last seen ${player.hoursSinceSeen}h ago)${suspensionInfo}`);
-          
-          return {
-            ...player,
-            confirmedBanned: activityData.banned,
-            suspended: activityData.suspended,
-            suspendedUntil: activityData.suspendedUntil,
-            lastRating: player.ratings[player.ratings.length - 1]
-          };
-        } else {
-          console.log(`Still active: ${player.nick} (likely inactivity drop)`);
-          return null;
-        }
-      } catch (error) {
-        console.log(`Error checking ${player.nick}: ${error.message}`);
-        return null;
-      }
-    });
-    
-    const results = await Promise.all(promises);
-    bannedPlayers.push(...results.filter(result => result !== null));
-    
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-  
-  console.log(`Verification completed: ${bannedPlayers.length} confirmed bans/suspensions`);
-  return bannedPlayers;
 }
 
 async function sendUnbanNotification(player, playerData) {
@@ -323,7 +511,10 @@ async function sendUnbanNotification(player, playerData) {
       ])
       .setTimestamp();
     
-    await channel.send({ embeds: [embed] });
+    await channel.send({ 
+      content: `<@&${UNBAN_ROLE_ID}>`,
+      embeds: [embed] 
+    });
     console.log(`Unban/unsuspend notification sent for ${player.nick}`);
   } catch (error) {
     console.error('Error sending unban notification:', error);
@@ -338,7 +529,7 @@ async function sendBanNotification(bannedPlayers) {
       const player = bannedPlayers[0];
       const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
       
-      const title = player.confirmedBanned ? 'Player Banned' : '⏸Player Suspended';
+      const title = player.confirmedBanned ? '🚫 Player Banned' : '⏸️ Player Suspended';
       const description = player.confirmedBanned ? 
         `**${player.nick}** has been banned !!!` :
         `**${player.nick}** has been suspended until ${new Date(player.suspendedUntil).toLocaleString()}`;
@@ -355,7 +546,10 @@ async function sendBanNotification(bannedPlayers) {
         ])
         .setTimestamp();
       
-      await channel.send({ embeds: [embed] });
+      await channel.send({ 
+        content: `<@&${BAN_ROLE_ID}>`,
+        embeds: [embed] 
+      });
     } else {
       const banned = bannedPlayers.filter(p => p.confirmedBanned);
       const suspended = bannedPlayers.filter(p => p.suspended && !p.confirmedBanned);
@@ -393,7 +587,11 @@ async function sendBanNotification(bannedPlayers) {
       }
       
       embed.setFooter({ text: `${bannedPlayers.length} total actions detected` });
-      await channel.send({ embeds: [embed] });
+      
+      await channel.send({ 
+        content: `<@&${BAN_ROLE_ID}>`,
+        embeds: [embed] 
+      });
     }
     
     console.log(`Ban/suspension notification sent for ${bannedPlayers.length} players`);
@@ -405,17 +603,17 @@ async function sendBanNotification(bannedPlayers) {
 function startAutomaticChecking() {
   console.log('Starting automatic checking every 2 hours...');
   
-  setTimeout(checkForBannedPlayers, 60000);
+  setTimeout(checkForBannedPlayers, 1000);
   
   checkInterval = setInterval(checkForBannedPlayers, CHECK_INTERVAL);
 }
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
-  console.log(`Monitoring channel: ${ALLOWED_CHANNEL_ID}`);
-  console.log(`Unban notifications channel: ${UNBAN_CHANNEL_ID}`);
-  console.log(`Checking for bans every 2 hours`);
+  console.log(`Monitoring top 2000 players only`);
+  console.log(`Check interval: 2 hours`);
   
+  initializeCSVFiles();
   startAutomaticChecking();
 });
 
@@ -443,13 +641,13 @@ client.on('messageCreate', async (message) => {
       const activePlayers = Object.values(data.players).filter(p => p.status === 'active').length;
       const bannedPlayers = Object.values(data.players).filter(p => p.status === 'banned').length;
       const suspendedPlayers = Object.values(data.players).filter(p => p.status === 'suspended').length;
-      const lastCheck2 = '2025-05-31T08:24:55.484Z';
-      const parisTime = lastCheck2
-        ? DateTime.fromISO(lastCheck2).setZone('Europe/Paris').toFormat("dd/MM/yyyy HH:mm:ss")
+      const lastCheck = data.lastCheck;
+      const parisTime = lastCheck
+        ? DateTime.fromMillis(lastCheck).setZone('Europe/Paris').toFormat("dd/MM/yyyy HH:mm:ss")
         : 'Never';
 
       const embed = new EmbedBuilder()
-        .setTitle('Stats :')
+        .setTitle('📊 Bot Statistics (Top 2000)')
         .setColor(0x00FF00)
         .addFields([
           { name: 'Total Players Tracked', value: totalPlayers.toString(), inline: true },
@@ -457,12 +655,13 @@ client.on('messageCreate', async (message) => {
           { name: 'Banned Players', value: bannedPlayers.toString(), inline: true },
           { name: 'Suspended Players', value: suspendedPlayers.toString(), inline: true },
           { name: 'Total Checks', value: (data.totalChecks || 0).toString(), inline: true },
+          { name: 'Rate Limit Hits/Hour', value: rateLimitCounter.toString(), inline: true },
           {
             name: 'Last Check',
-            value: `${parisTime}\n(Timezone: CEST - Paris time)`,
-            inline: true
+            value: `${parisTime}\n(CEST - Paris time)`,
+            inline: false
           },
-          { name: 'Check Frequency', value: 'Every 2 hours', inline: false }
+          { name: 'Check Frequency', value: 'Every 2 hours (Top 2000 only)', inline: false }
         ])
         .setTimestamp();
 
@@ -474,7 +673,6 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// SECURITY CHECK: Ensure required environment variables are set
 if (!NCFA_COOKIE || NCFA_COOKIE === 'YOUR_NCFA_COOKIE_HERE') {
   console.error('GEOGUESSR_COOKIE environment variable required');
   process.exit(1);
@@ -482,7 +680,6 @@ if (!NCFA_COOKIE || NCFA_COOKIE === 'YOUR_NCFA_COOKIE_HERE') {
 
 if (!DISCORD_TOKEN) {
   console.error('DISCORD_TOKEN environment variable is required');
-  console.error('Please set DISCORD_TOKEN in your environment variables');
   process.exit(1);
 }
 
