@@ -329,7 +329,7 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
             if (playerData.status !== 'banned') {
               isNewSanction = true;
             }
-          } else if (activityData.suspended) { // API says suspended (and not banned)
+          } else if (activityData.suspended) {
             if (playerData.status !== 'suspended' || playerData.suspendedUntil !== activityData.suspendedUntil) {
               isNewSanction = true;
             }
@@ -345,7 +345,7 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
           } else {
             console.log(`[${processedCount}/${currentPlayers.length}] 🔄 Ongoing sanction: ${player.nick} (#${player.position}) - Status unchanged (API: ${activityData.banned ? 'banned' : 'suspended'})`);
           }
-          return { // Return current sanction info from API
+          return {
               userId: player.userId,
               nick: player.nick,
               confirmedBanned: activityData.banned,
@@ -353,7 +353,7 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
               suspendedUntil: activityData.suspendedUntil,
               lastRating: { rating: player.rating, position: player.position },
               hoursSinceSeen: 0,
-              isNewSanction: isNewSanction // Flag indicating if this is new to the bot
+              isNewSanction: isNewSanction
             };
         } else {
           console.log(`[${processedCount}/${currentPlayers.length}] ✅ Active: ${player.nick} (#${player.position}, ${player.rating} ELO)`);
@@ -422,7 +422,6 @@ async function checkForBannedPlayers() {
     const currentPlayers = await fetchCurrentLeaderboard();
     const currentTime = Date.now();
     
-    // Cache simple pour éviter les doublons dans la même vérification uniquement
     if (!data.eventCache) {
       data.eventCache = {
         currentCheckBans: {},
@@ -431,7 +430,6 @@ async function checkForBannedPlayers() {
       };
     }
     
-    // Nettoyer le cache au début de chaque vérification
     data.eventCache.currentCheckBans = {};
     data.eventCache.currentCheckUnbans = {};
     
@@ -452,7 +450,6 @@ async function checkForBannedPlayers() {
       currentPlayerIds.add(player.userId);
       
       if (!data.players[player.userId]) {
-        // Nouveau joueur
         data.players[player.userId] = {
           nick: player.nick,
           firstSeen: currentTime,
@@ -462,32 +459,26 @@ async function checkForBannedPlayers() {
         };
         console.log(`New player tracked: ${player.nick} (#${player.position})`);
       } else {
-        // Joueur existant
         const playerData = data.players[player.userId];
         playerData.nick = player.nick;
-        playerData.lastSeen = currentTime; // Player is on the current leaderboard
+        playerData.lastSeen = currentTime;
 
         const apiSanction = top2000ApiSanctionInfo.find(s => s && s.userId === player.userId);
 
-        if (apiSanction) { // API reports this player is currently banned or suspended
+        if (apiSanction) {
             if (apiSanction.isNewSanction) {
-                // This is a new ban/suspension or an update to suspension details.
-                // It will be collected later for the main ban notification.
-                // Update bot's internal state now.
                 console.log(`[STATUS UPDATE] New sanction for ${player.nick}. Bot status changing from ${playerData.status}.`);
                 if (apiSanction.confirmedBanned) {
                     playerData.status = 'banned';
-                    playerData.bannedAt = playerData.bannedAt || currentTime; // Keep first ban time
-                    delete playerData.suspendedUntil; // Clear suspension if now banned
+                    playerData.bannedAt = playerData.bannedAt || currentTime;
+                    delete playerData.suspendedUntil;
                     delete playerData.suspendedAt;
-                } else { // Suspended
+                } else {
                     playerData.status = 'suspended';
-                    playerData.suspendedAt = playerData.suspendedAt || currentTime; // Keep first suspension time
+                    playerData.suspendedAt = playerData.suspendedAt || currentTime;
                     playerData.suspendedUntil = apiSanction.suspendedUntil;
                 }
             } else {
-                // API reports an ongoing, unchanged sanction.
-                // Ensure bot's status is consistent, in case it was wrongly set to active.
                 if (playerData.status === 'active') {
                     console.warn(`[DATA CORRECTION] ${player.nick} is sanctioned by API (${apiSanction.confirmedBanned ? 'banned' : 'suspended'}) but bot thought 'active'. Correcting status.`);
                     if (apiSanction.confirmedBanned) playerData.status = 'banned';
@@ -497,9 +488,8 @@ async function checkForBannedPlayers() {
                     }
                 }
             }
-        } else { // API reports this player is active (and they are on the leaderboard)
+        } else { 
             if ((playerData.status === 'banned' || playerData.status === 'suspended' || playerData.status === 'suspension_expired') && !isFirstCheckAfterRestart) {
-                // Bot thought they were sanctioned, but API now says active.
                 const previousStatus = playerData.status;
                 const eventKeySuffix = previousStatus === 'banned' ? 'unban' : 'unsuspend';
                 const unbanKey = `${player.userId}_${eventKeySuffix}`;
@@ -508,13 +498,13 @@ async function checkForBannedPlayers() {
                     console.log(`Player ${player.nick} is active on API & leaderboard. Previous bot status: ${previousStatus}.`);
                     data.eventCache.currentCheckUnbans[unbanKey] = true;
 
-                    if (previousStatus === 'banned') { // Only send Discord notification for unbans
-                        await sendUnbanNotification(player, playerData); // playerData has old info for context
+                    if (previousStatus === 'banned') {
+                        await sendUnbanNotification(player, playerData);
                         console.log(`UNBANNED: ${player.nick} notification sent.`);
                     } else { // 'suspended' or 'suspension_expired'
                         console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
                     }
-                    addToUnbannedUnsuspendedCSV(player, playerData); // Log both to CSV
+                    addToUnbannedUnsuspendedCSV(player, playerData);
 
                     playerData.status = 'active';
                     playerData.unbannedAt = (previousStatus === 'banned') ? currentTime : playerData.unbannedAt;
@@ -524,7 +514,6 @@ async function checkForBannedPlayers() {
                     delete playerData.suspendedUntil;
                 }
             } else if (playerData.status !== 'active') {
-                // Silently update to active if bot thought sanctioned, but API says active now (and not covered by above)
                 if (isFirstCheckAfterRestart || playerData.status === 'suspension_expired') {
                     console.log(`[SILENT UPDATE] ${player.nick} from ${playerData.status} to active. API reports active.`);
                 }
@@ -535,7 +524,6 @@ async function checkForBannedPlayers() {
             }
         }
         
-        // Mettre à jour l'historique des ratings
         playerData.ratings.push({
             rating: player.rating,
             position: player.position,
@@ -545,16 +533,14 @@ async function checkForBannedPlayers() {
         if (playerData.ratings.length > 30) {
             playerData.ratings = playerData.ratings.slice(-30);
         }
-      } // Close the else block for existing player
-    } // Close the for loop for currentPlayers
+      }
+    }
     
-    // This code should be OUTSIDE the player loop
     if (isFirstCheckAfterRestart) {
         console.log('🔄 First check after restart - skipping unban notifications to avoid false positives');
         await sendStatusMessage('Bot restarted - status updated silently to avoid false unban notifications');
     }
     
-    // Check for expired suspensions - this should be outside the player loop
     for (const [userId, playerData] of Object.entries(data.players)) {
         if (playerData.status === 'suspended' && 
             playerData.suspendedUntil && 
@@ -567,7 +553,6 @@ async function checkForBannedPlayers() {
         }
     }
     
-    // Check for missing players - this should be outside the player loop
     const missingPlayers = [];
     const twelveHoursAgo = currentTime - (12 * 60 * 60 * 1000);
 
@@ -588,7 +573,6 @@ async function checkForBannedPlayers() {
       }
     }
     
-    // 5. Vérifier les joueurs manquants
     console.log(`\nFound ${missingPlayers.length} recently missing players to verify`);
     const missingPlayersApiSanctionInfo = missingPlayers.length > 0 ?
       await verifyBannedPlayers(missingPlayers, data, currentTime) : [];
@@ -626,7 +610,6 @@ async function checkForBannedPlayers() {
       }
     }
     
-    // 7. Sauvegarder et finaliser
     data.lastCheck = currentTime;
     data.totalChecks = (data.totalChecks || 0) + 1;
     savePlayerData(data);
@@ -687,14 +670,14 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
         const eloInfo = lastRating ? `${lastRating.rating} ELO` : 'N/A';
         
         if (activityData.banned || activityData.suspended) {
-          const pData = data.players[player.userId]; // Bot's stored data for this missing player
+          const pData = data.players[player.userId];
           
           let isNewSanction = false;
           if (activityData.banned) {
             if (pData.status !== 'banned') {
               isNewSanction = true;
             }
-          } else if (activityData.suspended) { // API says suspended (and not banned)
+          } else if (activityData.suspended) {
             if (pData.status !== 'suspended' || pData.suspendedUntil !== activityData.suspendedUntil) {
               isNewSanction = true;
             }
@@ -717,10 +700,9 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
             suspended: activityData.suspended,
             suspendedUntil: activityData.suspendedUntil,
             lastRating: lastRating,
-            isNewSanction: isNewSanction // Flag indicating if this is new to the bot
+            isNewSanction: isNewSanction
           };
         } else {
-          // Player is not banned/suspended, so they're just inactive
           console.log(`[${processedCount}/${top2000MissingPlayers.length}] ✅ Active (inactive drop): ${player.nick} (${positionInfo}, ${eloInfo}) - Last seen ${player.hoursSinceSeen}h ago`);
           return null;
         }
@@ -749,7 +731,6 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
       }
     });
     
-    // Add delay between batches if not the last batch
     if (i + BATCH_SIZE < top2000MissingPlayers.length) {
       let delay = INTER_BATCH_DELAY;
       
@@ -762,7 +743,6 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
       
       await new Promise(resolve => setTimeout(resolve, delay));
       
-      // Reduce rate limit counter every few batches
       if (batchNum % 3 === 0) {
         rateLimitHits = Math.floor(rateLimitHits / 2);
       }
