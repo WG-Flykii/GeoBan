@@ -316,6 +316,7 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
           if (!playerData) {
             playerData = {
               nick: player.nick,
+              countryCode: player.countryCode,
               firstSeen: currentTime,
               ratings: [{ rating: player.rating, position: player.position, timestamp: currentTime }],
               lastSeen: currentTime,
@@ -348,6 +349,7 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
           return {
               userId: player.userId,
               nick: player.nick,
+              countryCode: player.countryCode,
               confirmedBanned: activityData.banned,
               suspended: activityData.suspended,
               suspendedUntil: activityData.suspendedUntil,
@@ -411,7 +413,6 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
   
   return bannedPlayers;
 }
-
 
 async function checkForBannedPlayers() {
   const startTime = Date.now();
@@ -501,7 +502,7 @@ async function checkForBannedPlayers() {
                     if (previousStatus === 'banned') {
                         await sendUnbanNotification(player, playerData);
                         console.log(`UNBANNED: ${player.nick} notification sent.`);
-                    } else { // 'suspended' or 'suspension_expired'
+                    } else {
                         console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
                     }
                     addToUnbannedUnsuspendedCSV(player, playerData);
@@ -577,7 +578,30 @@ async function checkForBannedPlayers() {
     const missingPlayersApiSanctionInfo = missingPlayers.length > 0 ?
       await verifyBannedPlayers(missingPlayers, data, currentTime) : [];
     
-    const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...missingPlayersApiSanctionInfo].filter(s => s !== null);
+    console.log('\nChecking existing suspended/banned players for status changes...');
+    const existingSanctionedPlayers = [];
+
+    for (const [userId, playerData] of Object.entries(data.players)) {
+      if ((playerData.status === 'suspended' || playerData.status === 'banned') && 
+          playerData.lastSeen > currentTime - (7 * 24 * 60 * 60 * 1000)) {
+        
+        existingSanctionedPlayers.push({
+          userId,
+          nick: playerData.nick,
+          countryCode: playerData.countryCode,
+          status: playerData.status,
+          suspendedUntil: playerData.suspendedUntil,
+          lastSeen: playerData.lastSeen,
+          ratings: playerData.ratings
+        });
+      }
+    }
+
+    console.log(`Found ${existingSanctionedPlayers.length} existing sanctioned players to verify`);
+    const existingSanctionedApiInfo = existingSanctionedPlayers.length > 0 ?
+      await verifyExistingSanctionedPlayers(existingSanctionedPlayers, data, currentTime) : [];
+    
+    const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...missingPlayersApiSanctionInfo, ...existingSanctionedApiInfo].filter(s => s !== null);
     const allNewSanctionEvents = allSanctionsFromApi.filter(s => s.isNewSanction);
     
     if (allNewSanctionEvents.length > 0) {
@@ -619,7 +643,7 @@ async function checkForBannedPlayers() {
     
     const statusMessage = newBansCount > 0 
       ? `Check completed in ${duration}s. Found ${newBansCount} new/updated ban(s)/suspension(s).`
-      : `Check completed in ${duration}s. No new or updated bans/suspensions detected from ${currentPlayers.length + missingPlayers.length} players checked.`;
+      : `Check completed in ${duration}s. No new or updated bans/suspensions detected from ${currentPlayers.length + missingPlayers.length + existingSanctionedPlayers.length} players checked.`;
     
     await sendStatusMessage(statusMessage);
     console.log(`Check completed in ${duration} seconds. Total checks: ${data.totalChecks}`);
@@ -696,6 +720,7 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
           
           return {
             ...player,
+            countryCode: player.countryCode,
             confirmedBanned: activityData.banned,
             suspended: activityData.suspended,
             suspendedUntil: activityData.suspendedUntil,
@@ -758,6 +783,121 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
   return bannedPlayers;
 }
 
+
+async function verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentTime) {
+  console.log(`Verifying status changes for ${sanctionedPlayers.length} sanctioned players`);
+  
+  const statusChanges = [];
+  const BATCH_SIZE = 8;
+  const INTER_BATCH_DELAY = 200;
+  let rateLimitHits = 0;
+  let processedCount = 0;
+  
+  for (let i = 0; i < sanctionedPlayers.length; i += BATCH_SIZE) {
+    const batch = sanctionedPlayers.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i/BATCH_SIZE) + 1;
+    
+    console.log(`Processing sanctioned batch ${batchNum}/${Math.ceil(sanctionedPlayers.length/BATCH_SIZE)} (${batch.length} players)`);
+    
+    const promises = batch.map(async (player, index) => {
+      try {
+        if (index > 0) await new Promise(resolve => setTimeout(resolve, 75 * index));
+        
+        const activityData = await getUserActivity(player.userId);
+        processedCount++;
+        
+        const playerData = data.players[player.userId];
+        const lastRating = player.ratings[player.ratings.length - 1];
+        const positionInfo = lastRating ? `#${lastRating.position}` : 'N/A';
+        
+        let hasStatusChanged = false;
+        let newSanctionType = null;
+        
+        if (activityData.banned) {
+          if (playerData.status !== 'banned') {
+            hasStatusChanged = true;
+            newSanctionType = 'banned';
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🚫⬆️ STATUS UPGRADE: ${player.nick} (${positionInfo}) - ${playerData.status} → BANNED`);
+          } else {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🚫 Still banned: ${player.nick} (${positionInfo})`);
+          }
+        } else if (activityData.suspended) {
+          if (playerData.status === 'banned') {
+            hasStatusChanged = true;
+            newSanctionType = 'suspended';
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️⬇️ STATUS DOWNGRADE: ${player.nick} (${positionInfo}) - BANNED → SUSPENDED`);
+          } else if (playerData.status === 'suspended' && playerData.suspendedUntil !== activityData.suspendedUntil) {
+            hasStatusChanged = true;
+            newSanctionType = 'suspended';
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️🔄 SUSPENSION UPDATED: ${player.nick} (${positionInfo}) - New end date: ${new Date(activityData.suspendedUntil).toLocaleString()}`);
+          } else {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️ Still suspended: ${player.nick} (${positionInfo})`);
+          }
+        } else {
+          console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ No longer sanctioned: ${player.nick} (${positionInfo}) - Was ${playerData.status}`);
+          return null;
+        }
+        
+        if (hasStatusChanged) {
+          return {
+            userId: player.userId,
+            nick: player.nick,
+            countryCode: player.countryCode,
+            confirmedBanned: activityData.banned,
+            suspended: activityData.suspended,
+            suspendedUntil: activityData.suspendedUntil,
+            lastRating: lastRating || { rating: 'N/A', position: 'N/A' },
+            hoursSinceSeen: Math.floor((currentTime - player.lastSeen) / (60 * 60 * 1000)),
+            isNewSanction: true,
+            isStatusChange: true,
+            previousStatus: playerData.status
+          };
+        }
+        
+        return null;
+        
+      } catch (error) {
+        processedCount++;
+        console.log(`[${processedCount}/${sanctionedPlayers.length}] ❌ Error checking ${player.nick}: ${error.message}`);
+        
+        if (error.message.includes('Rate limited') || error.message.includes('429')) {
+          rateLimitHits++;
+        }
+        
+        return null;
+      }
+    });
+    
+    const results = await Promise.allSettled(promises);
+    
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value !== null) {
+        statusChanges.push(result.value);
+      } else if (result.status === 'rejected') {
+        console.log(`[ERROR] Promise rejected for ${batch[index]?.nick}: ${result.reason}`);
+      }
+    });
+    
+    if (i + BATCH_SIZE < sanctionedPlayers.length) {
+      let delay = INTER_BATCH_DELAY;
+      
+      if (rateLimitHits > 2) {
+        delay = INTER_BATCH_DELAY * 2;
+        console.log(`Rate limit detected, increasing delay to ${delay}ms`);
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  console.log(`\n--- Existing Sanctioned Players Verification Summary ---`);
+  console.log(`Total players checked: ${processedCount}/${sanctionedPlayers.length}`);
+  console.log(`Status changes detected: ${statusChanges.length}`);
+  
+  return statusChanges;
+}
+
+
 async function sendUnbanNotification(player, playerData) {
   try {
     const channel = await client.channels.fetch(UNBAN_CHANNEL_ID);
@@ -797,11 +937,12 @@ async function sendBanNotification(bannedPlayers) {
     if (bannedPlayers.length === 1) {
       const player = bannedPlayers[0];
       const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
-      
+
+      const flag = getCountryFlag(player.countryCode);
       const title = player.confirmedBanned ? '🚫 Player Banned' : '⏸️ Player Suspended';
       const description = player.confirmedBanned ? 
-        `**${player.nick}** has been banned !!!` :
-        `**${player.nick}** has been suspended until ${new Date(player.suspendedUntil).toLocaleString()}`;
+        `${flag} **${player.nick}** has been banned !!!` :
+        `${flag} **${player.nick}** has been suspended until ${new Date(player.suspendedUntil).toLocaleString()}`;
       
       const embed = new EmbedBuilder()
         .setTitle(title)
@@ -842,7 +983,8 @@ async function sendBanNotification(bannedPlayers) {
       const playerList = allPlayers.map(p => {
         const profileUrl = `https://www.geoguessr.com/user/${p.userId}`;
         const status = p.confirmedBanned ? '🚫' : '⏸️';
-        return `${status} **#${p.lastRating.position}** [${p.nick}](${profileUrl}) - ${p.lastRating.rating} ELO`;
+        const flag = getCountryFlag(p.countryCode);
+        return `${status} **#${p.lastRating.position}** ${flag} [${p.nick}](${profileUrl}) - ${p.lastRating.rating} ELO`;
       }).join('\n');
       
       if (playerList.length <= 4096) {
@@ -886,6 +1028,17 @@ client.once('ready', () => {
   startAutomaticChecking();
 });
 
+function getCountryFlag(countryCode) {
+  if (!countryCode || countryCode.length !== 2) return '';
+  
+  const codePoints = countryCode
+    .toUpperCase()
+    .split('')
+    .map(char => 127397 + char.charCodeAt());
+  
+  return String.fromCodePoint(...codePoints);
+}
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (message.channelId !== ALLOWED_CHANNEL_ID) return;
@@ -899,10 +1052,10 @@ client.on('messageCreate', async (message) => {
     
     try {
       await checkForBannedPlayers();
-      await message.reply('Manual ban check completed. Check console for details.');
+      await message.channel.send('Manual ban check completed.');
     } catch (error) {
       console.error('Error in manual check:', error);
-      await message.reply('Error during manual check.');
+      await message.reply('Error during manual check. Check console for details.');
     }
   }
   
