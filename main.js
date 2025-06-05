@@ -31,7 +31,7 @@ const HEADERS = {
 const PLAYER_TRACKING_FILE = 'player_tracking.json';
 const BANNED_SUSPENDED_CSV = 'banned_suspended_players.csv';
 const UNBANNED_UNSUSPENDED_CSV = 'unbanned_unsuspended_players.csv';
-const CHECK_INTERVAL = 2 * 60 * 60 * 1000;
+const CHECK_INTERVAL = 1 * 60 * 60 * 1000; // heure * minutes * secondes * ms
 
 let checkInterval;
 let rateLimitCounter = 0;
@@ -53,8 +53,8 @@ function logRateLimit() {
 }
 
 function initializeCSVFiles() {
-  const bannedSuspendedHeaders = 'Date,Username,UserID,Profile_URL,ELO,Position,Action_Type,Suspended_Until\n';
-  const unbannedUnsuspendedHeaders = 'Date,Username,UserID,Profile_URL,ELO,Position,Previous_Action_Type,Duration_Days\n';
+  const bannedSuspendedHeaders = 'Date,Username,UserID,Profile_URL,countryCode,ELO,Position,Action_Type,Suspended_Until\n';
+  const unbannedUnsuspendedHeaders = 'Date,Username,UserID,Profile_URL,countryCode,ELO,Position,Previous_Action_Type,Duration_Days\n';
   
   if (!fs.existsSync(BANNED_SUSPENDED_CSV)) {
     fs.writeFileSync(BANNED_SUSPENDED_CSV, bannedSuspendedHeaders, 'utf8');
@@ -87,6 +87,7 @@ function addToBannedSuspendedCSV(player) {
       escapeCSV(player.nick),
       escapeCSV(player.userId),
       escapeCSV(profileUrl),
+      escapeCSV(player.countryCode),
       escapeCSV(player.lastRating.rating),
       escapeCSV(player.lastRating.position),
       escapeCSV(actionType),
@@ -114,6 +115,7 @@ function addToUnbannedUnsuspendedCSV(player, playerData) {
       escapeCSV(player.nick),
       escapeCSV(player.userId),
       escapeCSV(profileUrl),
+      escapeCSV(player.countryCode),
       escapeCSV(player.rating),
       escapeCSV(player.position),
       escapeCSV(previousActionType),
@@ -124,6 +126,30 @@ function addToUnbannedUnsuspendedCSV(player, playerData) {
     console.log(`Added to unbanned/unsuspended CSV: ${player.nick} (${previousActionType} - ${actionDuration} days)`);
   } catch (error) {
     console.error('Error adding to unbanned/unsuspended CSV:', error);
+  }
+}
+
+function addToDeletedAccountsCSV(player) {
+  try {
+    const date = new Date().toISOString().split('T')[0];
+    const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
+    
+    const csvLine = [
+      escapeCSV(date),
+      escapeCSV(player.nick),
+      escapeCSV(player.userId),
+      escapeCSV(profileUrl),
+      escapeCSV(player.countryCode),
+      escapeCSV(player.lastRating.rating),
+      escapeCSV(player.lastRating.position),
+      escapeCSV('DELETED_ACCOUNT'),
+      escapeCSV('')
+    ].join(',') + '\n';
+    
+    fs.appendFileSync(BANNED_SUSPENDED_CSV, csvLine, 'utf8');
+    console.log(`Added to CSV as deleted account: ${player.nick}`);
+  } catch (error) {
+    console.error('Error adding deleted account to CSV:', error);
   }
 }
 
@@ -216,6 +242,57 @@ function savePlayerData(data) {
   }
 }
 
+function getCountryFlag(countryCode) {
+  if (!countryCode || typeof countryCode !== 'string') return '🏳️';
+  
+  const code = countryCode.toLowerCase();
+  
+  if (code === 'zz') return '🏳️';
+
+  const supportedByDiscord = new Set([
+    'ad','ae','af','ag','ai','al','am','ao','ar','as','at','au','aw','ax','az',
+    'ba','bb','bd','be','bf','bg','bh','bi','bj','bl','bm','bn','bo','bq','br','bs','bt','bw','by','bz',
+    'ca','cc','cd','cf','cg','ch','ci','ck','cl','cm','cn','co','cr','cu','cv','cw','cx','cy','cz',
+    'de','dj','dk','dm','do','dz',
+    'ec','ee','eg','eh','er','es','et',
+    'fi','fj','fm','fo','fr',
+    'ga','gb','gd','ge','gf','gg','gh','gi','gl','gm','gn','gp','gq','gr','gt','gu','gw','gy',
+    'hk','hn','hr','ht','hu',
+    'id','ie','il','im','in','io','iq','ir','is','it',
+    'je','jm','jo','jp',
+    'ke','kg','kh','ki','km','kn','kp','kr','kw','ky','kz',
+    'la','lb','lc','li','lk','lr','ls','lt','lu','lv','ly',
+    'ma','mc','md','me','mf','mg','mh','mk','ml','mm','mn','mo','mp','mq','mr','ms','mt','mu','mv','mw','mx','my','mz',
+    'na','nc','ne','nf','ng','ni','nl','no','np','nr','nu','nz',
+    'om',
+    'pa','pe','pf','pg','ph','pk','pl','pm','pn','pr','pt','pw','py',
+    'qa',
+    're','ro','rs','ru','rw',
+    'sa','sb','sc','sd','se','sg','sh','si','sj','sk','sl','sm','sn','so','sr','ss','st','sv','sx','sy','sz',
+    'tc','td','tf','tg','th','tj','tk','tl','tm','tn','to','tr','tt','tv','tz',
+    'ua','ug','um','us','uy','uz',
+    'va','vc','ve','vg','vi','vn','vu',
+    'wf','ws',
+    'ye','yt',
+    'za','zm','zw'
+  ]);
+
+
+  if (supportedByDiscord.has(code)) {
+    return `:flag_${code}:`;
+  }
+
+  if (code.length === 2) {
+    const codePoints = [...code.toUpperCase()]
+      .map(char => 127397 + char.charCodeAt());
+    return String.fromCodePoint(...codePoints);
+  }
+
+  return '🏳️';
+}
+
+
+
 async function fetchCurrentLeaderboard() {
   console.log('Fetching top 2000 leaderboard...');
   const allPlayers = [];
@@ -266,7 +343,11 @@ async function getUserActivity(userId) {
     };
   } catch (error) {
     if (error.message.includes('404') || error.message.includes('403')) {
-      return { accessible: false, banned: true };
+      return { 
+        accessible: false, 
+        banned: false,
+        deleted: true
+      };
     }
     throw error;
   }
@@ -310,6 +391,43 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
         
         const activityData = await getUserActivity(player.userId);
         processedCount++;
+        
+        if (activityData.deleted) {
+          let playerData = data.players[player.userId];
+          if (!playerData) {
+            playerData = {
+              nick: player.nick,
+              countryCode: player.countryCode,
+              firstSeen: currentTime,
+              ratings: [{ rating: player.rating, position: player.position, timestamp: currentTime }],
+              lastSeen: currentTime,
+              status: 'active'
+            };
+            data.players[player.userId] = playerData;
+          }
+          
+          let isNewDeletion = false;
+          if (playerData.status !== 'deleted_account') {
+            isNewDeletion = true;
+            playerData.status = 'deleted_account';
+            playerData.deletedAt = currentTime;
+            
+            console.log(`[${processedCount}/${currentPlayers.length}] 🗑️ DELETED ACCOUNT: ${player.nick} (#${player.position}, ${player.rating} ELO)`);
+            
+            return {
+              userId: player.userId,
+              nick: player.nick,
+              countryCode: player.countryCode,
+              deletedAccount: true,
+              lastRating: { rating: player.rating, position: player.position },
+              hoursSinceSeen: 0,
+              isNewDeletion: isNewDeletion
+            };
+          } else {
+            console.log(`[${processedCount}/${currentPlayers.length}] 🔄 Already marked as deleted: ${player.nick} (#${player.position})`);
+            return null;
+          }
+        }
         
         if (activityData.banned || activityData.suspended) {
           let playerData = data.players[player.userId];
@@ -407,7 +525,8 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
   
   console.log(`\n--- Top 2000 Verification Summary ---`);
   console.log(`Total players checked: ${processedCount}/${currentPlayers.length}`);
-  console.log(`Confirmed bans/suspensions found: ${bannedPlayers.length}`);
+  console.log(`Confirmed bans/suspensions found: ${bannedPlayers.filter(p => !p.deletedAccount).length}`);
+  console.log(`Deleted accounts found: ${bannedPlayers.filter(p => p.deletedAccount).length}`);
   console.log(`Active players: ${processedCount - bannedPlayers.length}`);
   console.log(`Rate limit hits during verification: ${rateLimitHits}`);
   
@@ -602,7 +721,9 @@ async function checkForBannedPlayers() {
       await verifyExistingSanctionedPlayers(existingSanctionedPlayers, data, currentTime) : [];
     
     const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...missingPlayersApiSanctionInfo, ...existingSanctionedApiInfo].filter(s => s !== null);
-    const allNewSanctionEvents = allSanctionsFromApi.filter(s => s.isNewSanction);
+    const allDeletedAccounts = allSanctionsFromApi.filter(s => s && s.deletedAccount && s.isNewDeletion);
+    const allNewSanctionEvents = allSanctionsFromApi.filter(s => s && s.isNewSanction && !s.deletedAccount);
+    
     
     if (allNewSanctionEvents.length > 0) {
       console.log(`\nProcessing ${allNewSanctionEvents.length} new/updated bans/suspensions for notification...`);
@@ -634,6 +755,16 @@ async function checkForBannedPlayers() {
       }
     }
     
+    if (allDeletedAccounts.length > 0) {
+      console.log(`\nProcessing ${allDeletedAccounts.length} deleted accounts...`);
+      
+      await sendDeletedAccountNotification(allDeletedAccounts);
+      
+      for (const player of allDeletedAccounts) {
+        addToDeletedAccountsCSV(player);
+      }
+    }
+
     data.lastCheck = currentTime;
     data.totalChecks = (data.totalChecks || 0) + 1;
     savePlayerData(data);
@@ -647,6 +778,7 @@ async function checkForBannedPlayers() {
     
     await sendStatusMessage(statusMessage);
     console.log(`Check completed in ${duration} seconds. Total checks: ${data.totalChecks}`);
+    console.log(`At: ${new Date().toLocaleTimeString()}`);
     
   } catch (error) {
     console.error('Error during check:', error);
@@ -692,6 +824,30 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
         const lastRating = player.ratings[player.ratings.length - 1];
         const positionInfo = lastRating ? `#${lastRating.position}` : 'N/A';
         const eloInfo = lastRating ? `${lastRating.rating} ELO` : 'N/A';
+        
+        if (activityData.deleted) {
+          const pData = data.players[player.userId];
+          
+          let isNewDeletion = false;
+          if (pData.status !== 'deleted_account') {
+            isNewDeletion = true;
+            pData.status = 'deleted_account';
+            pData.deletedAt = currentTime;
+            
+            console.log(`[${processedCount}/${top2000MissingPlayers.length}] 🗑️ DELETED ACCOUNT: ${player.nick} (${positionInfo}, ${eloInfo}) - Last seen ${player.hoursSinceSeen}h ago`);
+            
+            return {
+              ...player,
+              countryCode: player.countryCode,
+              deletedAccount: true,
+              lastRating: lastRating,
+              isNewDeletion: isNewDeletion
+            };
+          } else {
+            console.log(`[${processedCount}/${top2000MissingPlayers.length}] 🔄 Already marked as deleted: ${player.nick} (${positionInfo})`);
+            return null;
+          }
+        }
         
         if (activityData.banned || activityData.suspended) {
           const pData = data.players[player.userId];
@@ -776,7 +932,8 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
   
   console.log(`\n--- Missing Players Verification Summary ---`);
   console.log(`Total players checked: ${processedCount}/${top2000MissingPlayers.length}`);
-  console.log(`Confirmed bans/suspensions: ${bannedPlayers.length}`);
+  console.log(`Confirmed bans/suspensions: ${bannedPlayers.filter(p => !p.deletedAccount).length}`);
+  console.log(`Deleted accounts: ${bannedPlayers.filter(p => p.deletedAccount).length}`);
   console.log(`Still active (inactivity drops): ${processedCount - bannedPlayers.length}`);
   console.log(`Rate limit hits during verification: ${rateLimitHits}`);
   
@@ -1011,8 +1168,63 @@ async function sendBanNotification(bannedPlayers) {
   }
 }
 
+async function sendDeletedAccountNotification(deletedPlayers) {
+  try {
+    const channel = await client.channels.fetch(ALLOWED_CHANNEL_ID);
+    
+    if (deletedPlayers.length === 1) {
+      const player = deletedPlayers[0];
+      const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
+      const flag = getCountryFlag(player.countryCode);
+      
+      const embed = new EmbedBuilder()
+        .setTitle('🗑️ Account Deleted')
+        .setColor(0x808080)
+        .setDescription(`${flag} **${player.nick}** has deleted their account`)
+        .addFields([
+          { name: 'Last Position', value: `#${player.lastRating.position}`, inline: true },
+          { name: 'Last ELO', value: `${player.lastRating.rating} ELO`, inline: true },
+          { name: 'Last Seen', value: `${player.hoursSinceSeen || 0} hours ago`, inline: true },
+          { name: 'Profile URL', value: `[Deleted Profile](${profileUrl})`, inline: false }
+        ])
+        .setTimestamp();
+      
+      await channel.send({ embeds: [embed] });
+    } else {
+      const embed = new EmbedBuilder()
+        .setTitle(`🗑️ ${deletedPlayers.length} Accounts Deleted`)
+        .setColor(0x808080)
+        .setTimestamp();
+      
+      const playerList = deletedPlayers.map(p => {
+        const profileUrl = `https://www.geoguessr.com/user/${p.userId}`;
+        const flag = getCountryFlag(p.countryCode);
+        return `🗑️ **#${p.lastRating.position}** ${flag} [${p.nick}](${profileUrl}) - ${p.lastRating.rating} ELO`;
+      }).join('\n');
+      
+      if (playerList.length <= 4096) {
+        embed.setDescription(playerList);
+      } else {
+        const truncatedList = playerList.substring(0, 4093) + '...';
+        embed.setDescription(truncatedList);
+        embed.addFields([
+          { name: 'Note', value: 'List truncated - too many accounts to display', inline: false }
+        ]);
+      }
+      
+      embed.setFooter({ text: `${deletedPlayers.length} accounts deleted` });
+      
+      await channel.send({ embeds: [embed] });
+    }
+    
+    console.log(`Deleted account notification sent for ${deletedPlayers.length} players`);
+  } catch (error) {
+    console.error('Error sending deleted account notification:', error);
+  }
+}
+
 function startAutomaticChecking() {
-  console.log('Starting automatic checking every 2 hours...');
+  console.log('Starting automatic checking every hour...');
   
   setTimeout(checkForBannedPlayers, 1000);
   
@@ -1022,22 +1234,11 @@ function startAutomaticChecking() {
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
   console.log(`Monitoring top 2000 players only`);
-  console.log(`Check interval: 2 hours`);
   
   initializeCSVFiles();
   startAutomaticChecking();
 });
 
-function getCountryFlag(countryCode) {
-  if (!countryCode || countryCode.length !== 2) return '';
-  
-  const codePoints = countryCode
-    .toUpperCase()
-    .split('')
-    .map(char => 127397 + char.charCodeAt());
-  
-  return String.fromCodePoint(...codePoints);
-}
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
