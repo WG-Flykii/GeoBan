@@ -243,54 +243,13 @@ function savePlayerData(data) {
 }
 
 function getCountryFlag(countryCode) {
-  if (!countryCode || typeof countryCode !== 'string') return '🏳️';
-  
-  const code = countryCode.toLowerCase();
-  
-  if (code === 'zz') return '🏳️';
-
-  const supportedByDiscord = new Set([
-    'ad','ae','af','ag','ai','al','am','ao','ar','as','at','au','aw','ax','az',
-    'ba','bb','bd','be','bf','bg','bh','bi','bj','bl','bm','bn','bo','bq','br','bs','bt','bw','by','bz',
-    'ca','cc','cd','cf','cg','ch','ci','ck','cl','cm','cn','co','cr','cu','cv','cw','cx','cy','cz',
-    'de','dj','dk','dm','do','dz',
-    'ec','ee','eg','eh','er','es','et',
-    'fi','fj','fm','fo','fr',
-    'ga','gb','gd','ge','gf','gg','gh','gi','gl','gm','gn','gp','gq','gr','gt','gu','gw','gy',
-    'hk','hn','hr','ht','hu',
-    'id','ie','il','im','in','io','iq','ir','is','it',
-    'je','jm','jo','jp',
-    'ke','kg','kh','ki','km','kn','kp','kr','kw','ky','kz',
-    'la','lb','lc','li','lk','lr','ls','lt','lu','lv','ly',
-    'ma','mc','md','me','mf','mg','mh','mk','ml','mm','mn','mo','mp','mq','mr','ms','mt','mu','mv','mw','mx','my','mz',
-    'na','nc','ne','nf','ng','ni','nl','no','np','nr','nu','nz',
-    'om',
-    'pa','pe','pf','pg','ph','pk','pl','pm','pn','pr','pt','pw','py',
-    'qa',
-    're','ro','rs','ru','rw',
-    'sa','sb','sc','sd','se','sg','sh','si','sj','sk','sl','sm','sn','so','sr','ss','st','sv','sx','sy','sz',
-    'tc','td','tf','tg','th','tj','tk','tl','tm','tn','to','tr','tt','tv','tz',
-    'ua','ug','um','us','uy','uz',
-    'va','vc','ve','vg','vi','vn','vu',
-    'wf','ws',
-    'ye','yt',
-    'za','zm','zw'
-  ]);
-
-
-  if (supportedByDiscord.has(code)) {
-    return `:flag_${code}:`;
-  }
-
-  if (code.length === 2) {
-    const codePoints = [...code.toUpperCase()]
-      .map(char => 127397 + char.charCodeAt());
-    return String.fromCodePoint(...codePoints);
-  }
-
-  return '🏳️';
+    if (!countryCode || typeof countryCode !== "string" || countryCode.length !== 2) return "🏳️";
+    return countryCode
+        .toUpperCase()
+        .split('')
+        .map(char => String.fromCodePoint(0x1F1E6 + char.charCodeAt(0) - 65))
+        .join('');
 }
-
 
 
 async function fetchCurrentLeaderboard() {
@@ -572,6 +531,7 @@ async function checkForBannedPlayers() {
       if (!data.players[player.userId]) {
         data.players[player.userId] = {
           nick: player.nick,
+          countryCode: player.countryCode,
           firstSeen: currentTime,
           ratings: [{ rating: player.rating, position: player.position, timestamp: currentTime }],
           lastSeen: currentTime,
@@ -601,9 +561,12 @@ async function checkForBannedPlayers() {
             } else {
                 if (playerData.status === 'active') {
                     console.warn(`[DATA CORRECTION] ${player.nick} is sanctioned by API (${apiSanction.confirmedBanned ? 'banned' : 'suspended'}) but bot thought 'active'. Correcting status.`);
-                    if (apiSanction.confirmedBanned) playerData.status = 'banned';
-                    else {
+                    if (apiSanction.confirmedBanned) {
+                        playerData.status = 'banned';
+                        playerData.bannedAt = playerData.bannedAt || currentTime;
+                    } else {
                         playerData.status = 'suspended';
+                        playerData.suspendedAt = playerData.suspendedAt || currentTime;
                         playerData.suspendedUntil = apiSanction.suspendedUntil;
                     }
                 }
@@ -621,26 +584,20 @@ async function checkForBannedPlayers() {
                     if (previousStatus === 'banned') {
                         await sendUnbanNotification(player, playerData);
                         console.log(`UNBANNED: ${player.nick} notification sent.`);
+                        playerData.unbannedAt = currentTime;
                     } else {
                         console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
+                        playerData.unsuspendedAt = currentTime;
                     }
                     addToUnbannedUnsuspendedCSV(player, playerData);
 
                     playerData.status = 'active';
-                    playerData.unbannedAt = (previousStatus === 'banned') ? currentTime : playerData.unbannedAt;
-                    playerData.unsuspendedAt = (previousStatus === 'suspended' || previousStatus === 'suspension_expired') ? currentTime : playerData.unsuspendedAt;
-                    delete playerData.bannedAt;
-                    delete playerData.suspendedAt;
-                    delete playerData.suspendedUntil;
                 }
             } else if (playerData.status !== 'active') {
                 if (isFirstCheckAfterRestart || playerData.status === 'suspension_expired') {
                     console.log(`[SILENT UPDATE] ${player.nick} from ${playerData.status} to active. API reports active.`);
                 }
                 playerData.status = 'active';
-                delete playerData.bannedAt;
-                delete playerData.suspendedAt;
-                delete playerData.suspendedUntil;
             }
         }
         
@@ -991,7 +948,55 @@ async function verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentT
             console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️ Still suspended: ${player.nick} (${positionInfo})`);
           }
         } else {
-          console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ No longer sanctioned: ${player.nick} (${positionInfo}) - Was ${playerData.status}`);
+          if (playerData.status === 'banned' || playerData.status === 'suspended') {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ UNSANCTIONED: ${player.nick} (${positionInfo}) - Was ${playerData.status}, now active`);
+            
+            const currentPlayerIds = new Set();
+            const currentPlayers = await fetchCurrentLeaderboard();
+            if (currentPlayers) {
+              for (const cp of currentPlayers) {
+                currentPlayerIds.add(cp.userId);
+              }
+            }
+            
+            const isOnLeaderboard = currentPlayerIds.has(player.userId);
+            const eventKeySuffix = playerData.status === 'banned' ? 'unban' : 'unsuspend';
+            const unbanKey = `${player.userId}_${eventKeySuffix}`;
+            
+            if (!data.eventCache.currentCheckUnbans[unbanKey]) {
+              data.eventCache.currentCheckUnbans[unbanKey] = true;
+              
+              if (playerData.status === 'banned') {
+                const mockPlayer = {
+                  userId: player.userId,
+                  nick: player.nick,
+                  position: lastRating ? lastRating.position : 'N/A',
+                  rating: lastRating ? lastRating.rating : 'N/A'
+                };
+                await sendUnbanNotification(mockPlayer, playerData);
+                console.log(`UNBANNED: ${player.nick} notification sent.`);
+                playerData.unbannedAt = currentTime;
+              } else {
+                console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
+                playerData.unsuspendedAt = currentTime;
+              }
+              
+              const mockPlayerForCSV = {
+                userId: player.userId,
+                nick: player.nick,
+                position: lastRating ? lastRating.position : 'N/A',
+                rating: lastRating ? lastRating.rating : 'N/A',
+                countryCode: player.countryCode
+              };
+              addToUnbannedUnsuspendedCSV(mockPlayerForCSV, playerData);
+              
+              playerData.status = 'active';
+              delete playerData.suspendedUntil;
+              delete playerData.suspendedAt;
+            }
+          } else {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ No longer sanctioned: ${player.nick} (${positionInfo}) - Was ${playerData.status}`);
+          }
           return null;
         }
         
