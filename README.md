@@ -1,4 +1,4 @@
-## GeoBan by Flykii (@flykii) and Bojan (@bojanr)
+## GeoBan by Flykii (@flykii) and BojanR (@bojanr)
 ## Discord bot, checks every hours if someone who was in the gugusar ranked solo leaderboard got banned, unbanned or deleted their account
   
 in the main file : put the 2 channel ids with the channel ids of your server  
