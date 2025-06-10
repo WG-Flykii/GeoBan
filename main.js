@@ -153,7 +153,7 @@ function addToDeletedAccountsCSV(player) {
   }
 }
 
-function makeAPIRequest(url, maxRetries = 2) {
+function makeAPIRequest(url, maxRetries = 3) {
   return new Promise(async (resolve, reject) => {
     let lastError;
     
@@ -163,8 +163,13 @@ function makeAPIRequest(url, maxRetries = 2) {
           const request = https.get(url, { headers: HEADERS }, (res) => {
             if (res.statusCode === 429) {
               logRateLimit();
-              const retryAfter = parseInt(res.headers['retry-after']) || 30;
+              const retryAfter = parseInt(res.headers['retry-after']) || 15;
               rejectInner(new Error(`Rate limited. Retry after ${retryAfter} seconds`));
+              return;
+            }
+            
+            if (res.statusCode === 404 || res.statusCode === 403) {
+              rejectInner(new Error(`HTTP ${res.statusCode}: User not accessible`));
               return;
             }
             
@@ -202,9 +207,11 @@ function makeAPIRequest(url, maxRetries = 2) {
           if (error.message.includes('Rate limited')) {
             waitTime = error.message.includes('Retry after') ? 
               parseInt(error.message.match(/\d+/)[0]) * 1000 : 
-              Math.min(10000 + (attempt * 5000), 30000);
+              Math.min(15000 + (attempt * 5000), 45000);
+          } else if (error.message.includes('404') || error.message.includes('403')) {
+            waitTime = 2000 + (attempt * 1000);
           } else {
-            waitTime = 2000 + (attempt * 2000);
+            waitTime = 3000 + (attempt * 2000);
           }
           
           console.log(`Attempt ${attempt + 1} failed, waiting ${waitTime/1000}s: ${error.message}`);
@@ -242,6 +249,7 @@ function savePlayerData(data) {
   }
 }
 
+
 function getCountryFlag(countryCode) {
     if (!countryCode || typeof countryCode !== "string" || countryCode.length !== 2) return "🏳️";
     return countryCode
@@ -250,6 +258,7 @@ function getCountryFlag(countryCode) {
         .map(char => String.fromCodePoint(0x1F1E6 + char.charCodeAt(0) - 65))
         .join('');
 }
+
 
 
 async function fetchCurrentLeaderboard() {
@@ -265,7 +274,7 @@ async function fetchCurrentLeaderboard() {
       allPlayers.push(...players);
       
       if (offset + 100 < 2000) {
-        await delay(75); // check time
+        await delay(75);
       }
       
     } catch (error) {
@@ -290,22 +299,37 @@ async function getUserActivity(userId) {
     const url = `${API_BASE}/v3/users/${userId}`;
     const response = await makeAPIRequest(url);
     
-    const isBanned = response.isBanned === true;
-    const isSuspended = response.suspendedUntil !== null && new Date(response.suspendedUntil) > new Date();
+    const isBanned = response.isBanned === true || response.banned === true;
+    const suspendedUntil = response.suspendedUntil || response.suspended_until;
+    const isSuspended = suspendedUntil !== null && suspendedUntil !== undefined && new Date(suspendedUntil) > new Date();
+    
+    if (isBanned || isSuspended) {
+      console.log(`DEBUG: User ${userId} - isBanned: ${isBanned}, suspendedUntil: ${suspendedUntil}, calculated suspended: ${isSuspended}`);
+    }
     
     return {
       accessible: true,
+      countryCode: response.countryCode || response.country_code,
       banned: isBanned,
       suspended: isSuspended,
-      suspendedUntil: response.suspendedUntil,
+      suspendedUntil: suspendedUntil,
       profile: response.user || response
     };
   } catch (error) {
-    if (error.message.includes('404') || error.message.includes('403')) {
+    if (error.message.includes('404')) {
       return { 
         accessible: false, 
         banned: false,
-        deleted: true
+        deleted: true,
+        reason: 'User not found (404)'
+      };
+    } else if (error.message.includes('403')) {
+      console.log(`WARNING: 403 error for user ${userId} - could be private or banned`);
+      return { 
+        accessible: false, 
+        banned: false,
+        deleted: true,
+        reason: 'Access forbidden (403)'
       };
     }
     throw error;
@@ -332,10 +356,11 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
   console.log(`\n--- Starting verification of all ${currentPlayers.length} top 2000 players ---`);
   
   const bannedPlayers = [];
-  const BATCH_SIZE = 10;
+  const BATCH_SIZE = 15;
   const INTER_BATCH_DELAY = 150;
   let rateLimitHits = 0;
   let processedCount = 0;
+  let consecutiveErrors = 0;
   
   for (let i = 0; i < currentPlayers.length; i += BATCH_SIZE) {
     const batch = currentPlayers.slice(i, i + BATCH_SIZE);
@@ -346,10 +371,12 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
     
     const promises = batch.map(async (player, index) => {
       try {
-        if (index > 0) await new Promise(resolve => setTimeout(resolve, 50 * index));
+        if (index > 0) await new Promise(resolve => setTimeout(resolve, 30 * index));
         
         const activityData = await getUserActivity(player.userId);
         processedCount++;
+        consecutiveErrors = 0;
+        
         
         if (activityData.deleted) {
           let playerData = data.players[player.userId];
@@ -426,7 +453,7 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
           return {
               userId: player.userId,
               nick: player.nick,
-              countryCode: player.countryCode,
+              countryCode: activityData.countryCode,
               confirmedBanned: activityData.banned,
               suspended: activityData.suspended,
               suspendedUntil: activityData.suspendedUntil,
@@ -440,10 +467,17 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
         }
       } catch (error) {
         processedCount++;
+        consecutiveErrors++; 
+        
         console.log(`[${processedCount}/${currentPlayers.length}] ❌ Error checking ${player.nick} (#${player.position}): ${error.message}`);
         
         if (error.message.includes('Rate limited') || error.message.includes('429')) {
           rateLimitHits++;
+        }
+        
+        if (consecutiveErrors >= 3) {
+          console.log(`⚠️ ${consecutiveErrors} consecutive errors detected, forcing longer delay...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
         
         return null;
@@ -457,27 +491,36 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
         bannedPlayers.push(result.value);
       } else if (result.status === 'rejected') {
         console.log(`[ERROR] Promise rejected for ${batch[index]?.nick}: ${result.reason}`);
+        consecutiveErrors++;
       }
     });
     
-    if (batchNum % 10 === 0 || batchNum === totalBatches) {
+    if (batchNum % 5 === 0 || batchNum === totalBatches) {
       console.log(`--- Progress: ${processedCount}/${currentPlayers.length} players checked (${Math.round(processedCount/currentPlayers.length*100)}%) ---`);
     }
     
     if (i + BATCH_SIZE < currentPlayers.length) {
       let delay = INTER_BATCH_DELAY;
       
-      if (rateLimitHits > 5) {
+      if (rateLimitHits > 12) {
+        delay = INTER_BATCH_DELAY * 5;
+        console.log(`Very high rate limit detected (${rateLimitHits}), increasing delay to ${delay}ms`);
+      } else if (rateLimitHits > 8) {
         delay = INTER_BATCH_DELAY * 3;
-        console.log(`High rate limit detected, increasing delay to ${delay}ms`);
-      } else if (rateLimitHits > 2) {
+        console.log(`High rate limit detected (${rateLimitHits}), increasing delay to ${delay}ms`);
+      } else if (rateLimitHits > 4) {
         delay = INTER_BATCH_DELAY * 2;
+        console.log(`Moderate rate limit detected (${rateLimitHits}), increasing delay to ${delay}ms`);
+      } else if (consecutiveErrors > 5) {
+        delay = INTER_BATCH_DELAY * 2;
+        console.log(`High error rate detected (${consecutiveErrors}), increasing delay to ${delay}ms`);
       }
       
       await new Promise(resolve => setTimeout(resolve, delay));
       
       if (batchNum % 5 === 0) {
         rateLimitHits = Math.floor(rateLimitHits / 2);
+        consecutiveErrors = Math.floor(consecutiveErrors / 2);
       }
     }
   }
@@ -488,8 +531,195 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
   console.log(`Deleted accounts found: ${bannedPlayers.filter(p => p.deletedAccount).length}`);
   console.log(`Active players: ${processedCount - bannedPlayers.length}`);
   console.log(`Rate limit hits during verification: ${rateLimitHits}`);
+  console.log(`Final consecutive errors: ${consecutiveErrors}`);
   
   return bannedPlayers;
+}
+
+async function verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentTime) {
+  console.log(`Verifying status changes for ${sanctionedPlayers.length} sanctioned players`);
+  
+  const statusChanges = [];
+  const BATCH_SIZE = 8;
+  const INTER_BATCH_DELAY = 200;
+  let rateLimitHits = 0;
+  let processedCount = 0;
+  
+  for (let i = 0; i < sanctionedPlayers.length; i += BATCH_SIZE) {
+    const batch = sanctionedPlayers.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i/BATCH_SIZE) + 1;
+    
+    console.log(`Processing sanctioned batch ${batchNum}/${Math.ceil(sanctionedPlayers.length/BATCH_SIZE)} (${batch.length} players)`);
+    
+    const promises = batch.map(async (player, index) => {
+      try {
+        if (index > 0) await new Promise(resolve => setTimeout(resolve, 75 * index));
+        
+        const activityData = await getUserActivity(player.userId);
+        processedCount++;
+        
+        const playerData = data.players[player.userId];
+        const lastRating = player.ratings[player.ratings.length - 1];
+        const positionInfo = lastRating ? `#${lastRating.position}` : 'N/A';
+        
+        if (activityData.deleted) {
+          let isNewDeletion = false;
+          if (playerData.status !== 'deleted_account') {
+            isNewDeletion = true;
+            playerData.status = 'deleted_account';
+            playerData.deletedAt = currentTime;
+            
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🗑️ DELETED ACCOUNT: ${player.nick} (${positionInfo}) - Was ${player.status}`);
+            
+            return {
+              userId: player.userId,
+              nick: player.nick,
+              countryCode: player.countryCode,
+              deletedAccount: true,
+              lastRating: lastRating || { rating: 'N/A', position: 'N/A' },
+              isNewDeletion: isNewDeletion
+            };
+          } else {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🔄 Already marked as deleted: ${player.nick} (${positionInfo})`);
+            return null;
+          }
+        }
+        
+        let hasRealStatusChange = false;
+        let newSanctionType = null;
+        
+        if (activityData.banned) {
+          if (playerData.status !== 'banned') {
+            hasRealStatusChange = true;
+            newSanctionType = 'banned';
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🚫⬆️ STATUS UPGRADE TO BANNED: ${player.nick} (${positionInfo}) - ${playerData.status} → BANNED`);
+          } else {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🚫 Still banned: ${player.nick} (${positionInfo})`);
+            return null;
+          }
+        } else if (activityData.suspended) {
+          if (playerData.status === 'banned') {
+            hasRealStatusChange = true;
+            newSanctionType = 'suspended';
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️⬇️ STATUS DOWNGRADE TO SUSPENDED: ${player.nick} (${positionInfo}) - BANNED → SUSPENDED until ${new Date(activityData.suspendedUntil).toLocaleString()}`);
+          } else if (playerData.status === 'suspended') {
+            if (playerData.suspendedUntil !== activityData.suspendedUntil) {
+              hasRealStatusChange = true;
+              newSanctionType = 'suspended';
+              console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️🔄 SUSPENSION DATE UPDATED: ${player.nick} (${positionInfo}) - New end: ${new Date(activityData.suspendedUntil).toLocaleString()}`);
+            } else {
+              console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️ Still suspended: ${player.nick} (${positionInfo}) until ${new Date(activityData.suspendedUntil).toLocaleString()}`);
+              return null;
+            }
+          } else {
+            hasRealStatusChange = true;
+            newSanctionType = 'suspended';
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️ NEW SUSPENSION: ${player.nick} (${positionInfo}) - ${playerData.status} → SUSPENDED`);
+          }
+        } else {
+          if (playerData.status === 'banned' || playerData.status === 'suspended') {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ UNSANCTIONED: ${player.nick} (${positionInfo}) - Was ${playerData.status}, now active`);
+            
+            const currentPlayers = await fetchCurrentLeaderboard();
+            const isOnLeaderboard = currentPlayers && currentPlayers.some(cp => cp.userId === player.userId);
+            
+            const eventKeySuffix = playerData.status === 'banned' ? 'unban' : 'unsuspend';
+            const unbanKey = `${player.userId}_${eventKeySuffix}`;
+            
+            if (!data.eventCache.currentCheckUnbans[unbanKey]) {
+              data.eventCache.currentCheckUnbans[unbanKey] = true;
+              
+              if (playerData.status === 'banned') {
+                const mockPlayer = {
+                  userId: player.userId,
+                  nick: player.nick,
+                  position: lastRating ? lastRating.position : 'N/A',
+                  rating: lastRating ? lastRating.rating : 'N/A'
+                };
+                await sendUnbanNotification(mockPlayer, playerData);
+                console.log(`UNBANNED: ${player.nick} notification sent.`);
+                playerData.unbannedAt = currentTime;
+              } else {
+                console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
+                playerData.unsuspendedAt = currentTime;
+              }
+              
+              const mockPlayerForCSV = {
+                userId: player.userId,
+                nick: player.nick,
+                position: lastRating ? lastRating.position : 'N/A',
+                rating: lastRating ? lastRating.rating : 'N/A',
+                countryCode: player.countryCode
+              };
+              addToUnbannedUnsuspendedCSV(mockPlayerForCSV, playerData);
+              
+              playerData.status = 'active';
+              delete playerData.suspendedUntil;
+              delete playerData.suspendedAt;
+            }
+          } else {
+            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ No longer sanctioned: ${player.nick} (${positionInfo}) - Was ${playerData.status}`);
+          }
+          return null;
+        }
+        
+        if (hasRealStatusChange) {
+          return {
+            userId: player.userId,
+            nick: player.nick,
+            countryCode: activityData.countryCode,
+            confirmedBanned: activityData.banned,
+            suspended: activityData.suspended,
+            suspendedUntil: activityData.suspendedUntil,
+            lastRating: lastRating || { rating: 'N/A', position: 'N/A' },
+            hoursSinceSeen: Math.floor((currentTime - player.lastSeen) / (60 * 60 * 1000)),
+            isNewSanction: true,
+            isStatusChange: true,
+            previousStatus: playerData.status
+          };
+        }
+        
+        return null;
+        
+      } catch (error) {
+        processedCount++;
+        console.log(`[${processedCount}/${sanctionedPlayers.length}] ❌ Error checking ${player.nick}: ${error.message}`);
+        
+        if (error.message.includes('Rate limited') || error.message.includes('429')) {
+          rateLimitHits++;
+        }
+        
+        return null;
+      }
+    });
+    
+    const results = await Promise.allSettled(promises);
+    
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value !== null) {
+        statusChanges.push(result.value);
+      } else if (result.status === 'rejected') {
+        console.log(`[ERROR] Promise rejected for ${batch[index]?.nick}: ${result.reason}`);
+      }
+    });
+    
+    if (i + BATCH_SIZE < sanctionedPlayers.length) {
+      let delay = INTER_BATCH_DELAY;
+      
+      if (rateLimitHits > 2) {
+        delay = INTER_BATCH_DELAY * 2;
+        console.log(`Rate limit detected, increasing delay to ${delay}ms`);
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  console.log(`\n--- Existing Sanctioned Players Verification Summary ---`);
+  console.log(`Total players checked: ${processedCount}/${sanctionedPlayers.length}`);
+  console.log(`Real status changes detected: ${statusChanges.length}`);
+  
+  return statusChanges;
 }
 
 async function checkForBannedPlayers() {
@@ -522,6 +752,80 @@ async function checkForBannedPlayers() {
     
     const currentPlayerIds = new Set();
     
+    const missingPlayers = [];
+    const sixHourAgo = currentTime - (6 * 60 * 60 * 1000);
+
+    for (const [userId, playerData] of Object.entries(data.players)) {
+      if (playerData.lastSeen > sixHourAgo && 
+          playerData.status === 'active') {
+        
+        const isCurrentlyOnLeaderboard = currentPlayers.some(p => p.userId === userId);
+        
+        if (!isCurrentlyOnLeaderboard) {
+          const hoursSinceSeen = Math.floor((currentTime - playerData.lastSeen) / (60 * 60 * 1000));
+          
+          if (hoursSinceSeen >= 1 && hoursSinceSeen < 24) {
+            missingPlayers.push({
+              userId,
+              ...playerData,
+              hoursSinceSeen
+            });
+          }
+        }
+      }
+    }
+    
+    console.log(`Found ${missingPlayers.length} recently missing players to verify first`);
+    
+    let priorityBannedPlayers = [];
+    if (missingPlayers.length > 0) {
+      priorityBannedPlayers = await verifyBannedPlayers(missingPlayers, data, currentTime);
+      
+      if (priorityBannedPlayers.length > 0) {
+        const newBans = priorityBannedPlayers.filter(p => p.isNewSanction && !p.deletedAccount);
+        const newDeletions = priorityBannedPlayers.filter(p => p.deletedAccount && p.isNewDeletion);
+        
+        if (newBans.length > 0) {
+          await sendBanNotification(newBans);
+          
+          for (const player of newBans) {
+            const banKey = `${player.userId}_ban_${player.confirmedBanned ? 'banned' : 'suspended'}`;
+            
+            if (!data.eventCache.currentCheckBans[banKey]) {
+              data.eventCache.currentCheckBans[banKey] = true;
+              addToBannedSuspendedCSV(player);
+              
+              const pDataToUpdate = data.players[player.userId];
+              if (pDataToUpdate) {
+                if (player.confirmedBanned) {
+                  if (pDataToUpdate.status !== 'banned') pDataToUpdate.bannedAt = currentTime;
+                  pDataToUpdate.status = 'banned';
+                  delete pDataToUpdate.suspendedUntil; 
+                  delete pDataToUpdate.suspendedAt;
+                } else if (player.suspended) {
+                  if (pDataToUpdate.status !== 'suspended' || pDataToUpdate.suspendedUntil !== player.suspendedUntil) pDataToUpdate.suspendedAt = currentTime;
+                  pDataToUpdate.status = 'suspended';
+                  pDataToUpdate.suspendedUntil = player.suspendedUntil;
+                }
+              }
+            }
+          }
+        }
+        
+        if (newDeletions.length > 0) {
+          await sendDeletedAccountNotification(newDeletions);
+          for (const player of newDeletions) {
+            addToDeletedAccountsCSV(player);
+          }
+        }
+        
+        savePlayerData(data);
+        
+        const priorityDuration = Math.round((Date.now() - startTime) / 1000);
+        console.log(`Priority check completed in ${priorityDuration}s - found ${newBans.length} new bans/suspensions from missing players`);
+      }
+    }
+    
     console.log(`\nFetching API status for all ${currentPlayers.length} top 2000 players...`);
     const top2000ApiSanctionInfo = await verifyAllTop2000Players(currentPlayers, data, currentTime);
 
@@ -544,8 +848,9 @@ async function checkForBannedPlayers() {
         playerData.lastSeen = currentTime;
 
         const apiSanction = top2000ApiSanctionInfo.find(s => s && s.userId === player.userId);
+        const alreadyProcessedByPriority = priorityBannedPlayers.some(p => p && p.userId === player.userId);
 
-        if (apiSanction) {
+        if (apiSanction && !alreadyProcessedByPriority) {
             if (apiSanction.isNewSanction) {
                 console.log(`[STATUS UPDATE] New sanction for ${player.nick}. Bot status changing from ${playerData.status}.`);
                 if (apiSanction.confirmedBanned) {
@@ -571,8 +876,11 @@ async function checkForBannedPlayers() {
                     }
                 }
             }
-        } else { 
-            if ((playerData.status === 'banned' || playerData.status === 'suspended' || playerData.status === 'suspension_expired') && !isFirstCheckAfterRestart) {
+        } else if (!alreadyProcessedByPriority) { 
+            if ((playerData.status === 'banned' || playerData.status === 'suspended' || playerData.status === 'suspension_expired') && 
+                playerData.status !== 'deleted_account' &&
+                !isFirstCheckAfterRestart) {
+                
                 const previousStatus = playerData.status;
                 const eventKeySuffix = previousStatus === 'banned' ? 'unban' : 'unsuspend';
                 const unbanKey = `${player.userId}_${eventKeySuffix}`;
@@ -593,7 +901,7 @@ async function checkForBannedPlayers() {
 
                     playerData.status = 'active';
                 }
-            } else if (playerData.status !== 'active') {
+            } else if (playerData.status !== 'active' && playerData.status !== 'deleted_account') {
                 if (isFirstCheckAfterRestart || playerData.status === 'suspension_expired') {
                     console.log(`[SILENT UPDATE] ${player.nick} from ${playerData.status} to active. API reports active.`);
                 }
@@ -630,35 +938,12 @@ async function checkForBannedPlayers() {
         }
     }
     
-    const missingPlayers = [];
-    const twelveHoursAgo = currentTime - (12 * 60 * 60 * 1000);
-
-    for (const [userId, playerData] of Object.entries(data.players)) {
-      if (!currentPlayerIds.has(userId) && 
-          playerData.lastSeen > twelveHoursAgo && 
-          playerData.status === 'active') {
-        
-        const hoursSinceSeen = Math.floor((currentTime - playerData.lastSeen) / (60 * 60 * 1000));
-        
-        if (hoursSinceSeen >= 2 && hoursSinceSeen < 36) {
-          missingPlayers.push({
-            userId,
-            ...playerData,
-            hoursSinceSeen
-          });
-        }
-      }
-    }
-    
-    console.log(`\nFound ${missingPlayers.length} recently missing players to verify`);
-    const missingPlayersApiSanctionInfo = missingPlayers.length > 0 ?
-      await verifyBannedPlayers(missingPlayers, data, currentTime) : [];
-    
     console.log('\nChecking existing suspended/banned players for status changes...');
     const existingSanctionedPlayers = [];
 
     for (const [userId, playerData] of Object.entries(data.players)) {
       if ((playerData.status === 'suspended' || playerData.status === 'banned') && 
+          playerData.status !== 'deleted_account' &&
           playerData.lastSeen > currentTime - (7 * 24 * 60 * 60 * 1000)) {
         
         existingSanctionedPlayers.push({
@@ -677,10 +962,9 @@ async function checkForBannedPlayers() {
     const existingSanctionedApiInfo = existingSanctionedPlayers.length > 0 ?
       await verifyExistingSanctionedPlayers(existingSanctionedPlayers, data, currentTime) : [];
     
-    const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...missingPlayersApiSanctionInfo, ...existingSanctionedApiInfo].filter(s => s !== null);
+    const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...existingSanctionedApiInfo].filter(s => s !== null);
     const allDeletedAccounts = allSanctionsFromApi.filter(s => s && s.deletedAccount && s.isNewDeletion);
     const allNewSanctionEvents = allSanctionsFromApi.filter(s => s && s.isNewSanction && !s.deletedAccount);
-    
     
     if (allNewSanctionEvents.length > 0) {
       console.log(`\nProcessing ${allNewSanctionEvents.length} new/updated bans/suspensions for notification...`);
@@ -727,11 +1011,11 @@ async function checkForBannedPlayers() {
     savePlayerData(data);
     
     const duration = Math.round((Date.now() - startTime) / 1000);
-    const newBansCount = allNewSanctionEvents.length;
+    const totalNewBans = (priorityBannedPlayers.filter(p => p.isNewSanction && !p.deletedAccount).length) + allNewSanctionEvents.length;
     
-    const statusMessage = newBansCount > 0 
-      ? `Check completed in ${duration}s. Found ${newBansCount} new/updated ban(s)/suspension(s).`
-      : `Check completed in ${duration}s. No new or updated bans/suspensions detected from ${currentPlayers.length + missingPlayers.length + existingSanctionedPlayers.length} players checked.`;
+    const statusMessage = totalNewBans > 0 
+      ? `Check completed in ${duration}s. Found ${totalNewBans} new/updated ban(s)/suspension(s).`
+      : `Check completed in ${duration}s. No new or updated bans/suspensions detected.`;
     
     await sendStatusMessage(statusMessage);
     console.log(`Check completed in ${duration} seconds. Total checks: ${data.totalChecks}`);
@@ -746,10 +1030,7 @@ async function checkForBannedPlayers() {
 async function verifyBannedPlayers(missingPlayers, data, currentTime) {
   console.log(`Verifying ban status for ${missingPlayers.length} missing players`);
   
-  const top2000MissingPlayers = missingPlayers.filter(player => {
-    const lastRating = player.ratings[player.ratings.length - 1];
-    return lastRating && lastRating.position <= 2000;
-  });
+  const top2000MissingPlayers = missingPlayers;
   
   console.log(`${top2000MissingPlayers.length} of ${missingPlayers.length} missing players were in top 2000`);
   
@@ -758,8 +1039,8 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
   }
   
   const bannedPlayers = [];
-  const BATCH_SIZE = 10;
-  const INTER_BATCH_DELAY = 150;
+  const BATCH_SIZE = 12;
+  const INTER_BATCH_DELAY = 120;
   let rateLimitHits = 0;
   let processedCount = 0;
   
@@ -773,7 +1054,7 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
     
     const promises = batch.map(async (player, index) => {
       try {
-        if (index > 0) await new Promise(resolve => setTimeout(resolve, 50 * index));
+        if (index > 0) await new Promise(resolve => setTimeout(resolve, 35 * index));
         
         const activityData = await getUserActivity(player.userId);
         processedCount++;
@@ -833,7 +1114,7 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
           
           return {
             ...player,
-            countryCode: player.countryCode,
+            countryCode: activityData.countryCode,
             confirmedBanned: activityData.banned,
             suspended: activityData.suspended,
             suspendedUntil: activityData.suspendedUntil,
@@ -872,10 +1153,10 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
     if (i + BATCH_SIZE < top2000MissingPlayers.length) {
       let delay = INTER_BATCH_DELAY;
       
-      if (rateLimitHits > 3) {
+      if (rateLimitHits > 5) {
         delay = INTER_BATCH_DELAY * 3;
         console.log(`Rate limit detected, increasing delay to ${delay}ms`);
-      } else if (rateLimitHits > 1) {
+      } else if (rateLimitHits > 2) {
         delay = INTER_BATCH_DELAY * 2;
       }
       
@@ -895,168 +1176,6 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
   console.log(`Rate limit hits during verification: ${rateLimitHits}`);
   
   return bannedPlayers;
-}
-
-
-async function verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentTime) {
-  console.log(`Verifying status changes for ${sanctionedPlayers.length} sanctioned players`);
-  
-  const statusChanges = [];
-  const BATCH_SIZE = 8;
-  const INTER_BATCH_DELAY = 200;
-  let rateLimitHits = 0;
-  let processedCount = 0;
-  
-  for (let i = 0; i < sanctionedPlayers.length; i += BATCH_SIZE) {
-    const batch = sanctionedPlayers.slice(i, i + BATCH_SIZE);
-    const batchNum = Math.floor(i/BATCH_SIZE) + 1;
-    
-    console.log(`Processing sanctioned batch ${batchNum}/${Math.ceil(sanctionedPlayers.length/BATCH_SIZE)} (${batch.length} players)`);
-    
-    const promises = batch.map(async (player, index) => {
-      try {
-        if (index > 0) await new Promise(resolve => setTimeout(resolve, 75 * index));
-        
-        const activityData = await getUserActivity(player.userId);
-        processedCount++;
-        
-        const playerData = data.players[player.userId];
-        const lastRating = player.ratings[player.ratings.length - 1];
-        const positionInfo = lastRating ? `#${lastRating.position}` : 'N/A';
-        
-        let hasStatusChanged = false;
-        let newSanctionType = null;
-        
-        if (activityData.banned) {
-          if (playerData.status !== 'banned') {
-            hasStatusChanged = true;
-            newSanctionType = 'banned';
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🚫⬆️ STATUS UPGRADE: ${player.nick} (${positionInfo}) - ${playerData.status} → BANNED`);
-          } else {
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] 🚫 Still banned: ${player.nick} (${positionInfo})`);
-          }
-        } else if (activityData.suspended) {
-          if (playerData.status === 'banned') {
-            hasStatusChanged = true;
-            newSanctionType = 'suspended';
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️⬇️ STATUS DOWNGRADE: ${player.nick} (${positionInfo}) - BANNED → SUSPENDED`);
-          } else if (playerData.status === 'suspended' && playerData.suspendedUntil !== activityData.suspendedUntil) {
-            hasStatusChanged = true;
-            newSanctionType = 'suspended';
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️🔄 SUSPENSION UPDATED: ${player.nick} (${positionInfo}) - New end date: ${new Date(activityData.suspendedUntil).toLocaleString()}`);
-          } else {
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️ Still suspended: ${player.nick} (${positionInfo})`);
-          }
-        } else {
-          if (playerData.status === 'banned' || playerData.status === 'suspended') {
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ UNSANCTIONED: ${player.nick} (${positionInfo}) - Was ${playerData.status}, now active`);
-            
-            const currentPlayerIds = new Set();
-            const currentPlayers = await fetchCurrentLeaderboard();
-            if (currentPlayers) {
-              for (const cp of currentPlayers) {
-                currentPlayerIds.add(cp.userId);
-              }
-            }
-            
-            const isOnLeaderboard = currentPlayerIds.has(player.userId);
-            const eventKeySuffix = playerData.status === 'banned' ? 'unban' : 'unsuspend';
-            const unbanKey = `${player.userId}_${eventKeySuffix}`;
-            
-            if (!data.eventCache.currentCheckUnbans[unbanKey]) {
-              data.eventCache.currentCheckUnbans[unbanKey] = true;
-              
-              if (playerData.status === 'banned') {
-                const mockPlayer = {
-                  userId: player.userId,
-                  nick: player.nick,
-                  position: lastRating ? lastRating.position : 'N/A',
-                  rating: lastRating ? lastRating.rating : 'N/A'
-                };
-                await sendUnbanNotification(mockPlayer, playerData);
-                console.log(`UNBANNED: ${player.nick} notification sent.`);
-                playerData.unbannedAt = currentTime;
-              } else {
-                console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
-                playerData.unsuspendedAt = currentTime;
-              }
-              
-              const mockPlayerForCSV = {
-                userId: player.userId,
-                nick: player.nick,
-                position: lastRating ? lastRating.position : 'N/A',
-                rating: lastRating ? lastRating.rating : 'N/A',
-                countryCode: player.countryCode
-              };
-              addToUnbannedUnsuspendedCSV(mockPlayerForCSV, playerData);
-              
-              playerData.status = 'active';
-              delete playerData.suspendedUntil;
-              delete playerData.suspendedAt;
-            }
-          } else {
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ No longer sanctioned: ${player.nick} (${positionInfo}) - Was ${playerData.status}`);
-          }
-          return null;
-        }
-        
-        if (hasStatusChanged) {
-          return {
-            userId: player.userId,
-            nick: player.nick,
-            countryCode: player.countryCode,
-            confirmedBanned: activityData.banned,
-            suspended: activityData.suspended,
-            suspendedUntil: activityData.suspendedUntil,
-            lastRating: lastRating || { rating: 'N/A', position: 'N/A' },
-            hoursSinceSeen: Math.floor((currentTime - player.lastSeen) / (60 * 60 * 1000)),
-            isNewSanction: true,
-            isStatusChange: true,
-            previousStatus: playerData.status
-          };
-        }
-        
-        return null;
-        
-      } catch (error) {
-        processedCount++;
-        console.log(`[${processedCount}/${sanctionedPlayers.length}] ❌ Error checking ${player.nick}: ${error.message}`);
-        
-        if (error.message.includes('Rate limited') || error.message.includes('429')) {
-          rateLimitHits++;
-        }
-        
-        return null;
-      }
-    });
-    
-    const results = await Promise.allSettled(promises);
-    
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled' && result.value !== null) {
-        statusChanges.push(result.value);
-      } else if (result.status === 'rejected') {
-        console.log(`[ERROR] Promise rejected for ${batch[index]?.nick}: ${result.reason}`);
-      }
-    });
-    
-    if (i + BATCH_SIZE < sanctionedPlayers.length) {
-      let delay = INTER_BATCH_DELAY;
-      
-      if (rateLimitHits > 2) {
-        delay = INTER_BATCH_DELAY * 2;
-        console.log(`Rate limit detected, increasing delay to ${delay}ms`);
-      }
-      
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-  
-  console.log(`\n--- Existing Sanctioned Players Verification Summary ---`);
-  console.log(`Total players checked: ${processedCount}/${sanctionedPlayers.length}`);
-  console.log(`Status changes detected: ${statusChanges.length}`);
-  
-  return statusChanges;
 }
 
 
@@ -1100,7 +1219,8 @@ async function sendBanNotification(bannedPlayers) {
       const player = bannedPlayers[0];
       const profileUrl = `https://www.geoguessr.com/user/${player.userId}`;
 
-      const flag = getCountryFlag(player.countryCode);
+      const flag = player.countryCode ? `:flag_${player.countryCode.toLowerCase()}:` : '';
+      
       const title = player.confirmedBanned ? '🚫 Player Banned' : '⏸️ Player Suspended';
       const description = player.confirmedBanned ? 
         `${flag} **${player.nick}** has been banned !!!` :
