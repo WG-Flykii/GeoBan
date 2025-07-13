@@ -17,6 +17,10 @@ const UNBAN_ROLE_ID = ''; // ping the role to notify people if someone got unban
 
 const ALLOWED_CHANNEL_ID = ''; // channel to announce when someone got banned
 const UNBAN_CHANNEL_ID = ''; // channel to announce when someone got unbanned
+const unsuspended_channel_id = ''; // channel to announce when a suspended player got unsuspended
+
+const NICKNAME_CHANGE_CHANNEL = ''; // channel to notify if someone renamed themselves
+const logs_channel = ''; // logs channel just to see if the bot is working well
 
 const API_BASE = 'https://www.geoguessr.com/api';
 const NCFA_COOKIE = process.env.GEOGUESSR_COOKIE;
@@ -24,7 +28,8 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  'Accept': 'application/json',
+  'Content-Type': 'application/json; charset=utf-8',
+  'Accept': 'application/json; charset=utf-8',
   'Cookie': `_ncfa=${NCFA_COOKIE}`
 };
 
@@ -241,6 +246,11 @@ function loadPlayerData() {
 }
 
 function savePlayerData(data) {
+  for (const [userId, playerData] of Object.entries(data.players)) {
+    if (playerData.nick) {
+      playerData.nick = normalizeUnicode(playerData.nick);
+    }
+  }
   try {
     fs.writeFileSync(PLAYER_TRACKING_FILE, JSON.stringify(data, null, 2));
     console.log('Player tracking data saved');
@@ -252,6 +262,8 @@ function savePlayerData(data) {
 
 function getCountryFlag(countryCode) {
     if (!countryCode || typeof countryCode !== "string" || countryCode.length !== 2) return "🏳️";
+    if (countryCode.toLowerCase() === "zz") return ":1393291205344759918:"; //emoji instead of :flag_zz:
+
     return countryCode
         .toUpperCase()
         .split('')
@@ -303,6 +315,8 @@ async function getUserActivity(userId) {
     const suspendedUntil = response.suspendedUntil || response.suspended_until;
     const isSuspended = suspendedUntil !== null && suspendedUntil !== undefined && new Date(suspendedUntil) > new Date();
     
+    const currentNick = response.nick || response.username || response.name || 'Unknown';
+    
     if (isBanned || isSuspended) {
       console.log(`DEBUG: User ${userId} - isBanned: ${isBanned}, suspendedUntil: ${suspendedUntil}, calculated suspended: ${isSuspended}`);
     }
@@ -313,7 +327,8 @@ async function getUserActivity(userId) {
       banned: isBanned,
       suspended: isSuspended,
       suspendedUntil: suspendedUntil,
-      profile: response.user || response
+      profile: response.user || response,
+      currentNick: currentNick
     };
   } catch (error) {
     if (error.message.includes('404')) {
@@ -338,7 +353,7 @@ async function getUserActivity(userId) {
 
 async function sendStatusMessage(message, isError = false) {
   try {
-    const channel = await client.channels.fetch(ALLOWED_CHANNEL_ID);
+    const channel = await client.channels.fetch(logs_channel);
     const embed = new EmbedBuilder()
       .setTitle(isError ? '❌ Check Failed' : '✅ Check Completed')
       .setColor(isError ? 0xFF0000 : 0x00FF00)
@@ -376,6 +391,21 @@ async function verifyAllTop2000Players(currentPlayers, data, currentTime) {
         const activityData = await getUserActivity(player.userId);
         processedCount++;
         consecutiveErrors = 0;
+        
+        if (activityData.accessible && activityData.currentNick) {
+          const playerData = data.players[player.userId];
+          if (playerData && playerData.nick !== activityData.currentNick) {
+            
+            if (!detectFalseNicknameChange(playerData.nick, activityData.currentNick)) {
+              const changed = checkNicknameChange(player.userId, playerData.nick, activityData.currentNick, playerData);
+              if (changed) {
+                playerData.nick = normalizeUnicode(activityData.currentNick);
+              }
+            } else {
+              console.log(`⚠️ False nickname change detected for ${player.userId}, keeping original: "${playerData.nick}"`);
+            }
+          }
+        }
         
         
         if (activityData.deleted) {
@@ -559,6 +589,12 @@ async function verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentT
         processedCount++;
         
         const playerData = data.players[player.userId];
+        if (activityData.accessible && activityData.currentNick) {
+          if (playerData && playerData.nick !== activityData.currentNick) {
+            checkNicknameChange(player.userId, playerData.nick, activityData.currentNick, playerData);
+            playerData.nick = activityData.currentNick;
+          }
+        }
         const lastRating = player.ratings[player.ratings.length - 1];
         const positionInfo = lastRating ? `#${lastRating.position}` : 'N/A';
         
@@ -617,50 +653,19 @@ async function verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentT
             console.log(`[${processedCount}/${sanctionedPlayers.length}] ⏸️ NEW SUSPENSION: ${player.nick} (${positionInfo}) - ${playerData.status} → SUSPENDED`);
           }
         } else {
-          if (playerData.status === 'banned' || playerData.status === 'suspended') {
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ UNSANCTIONED: ${player.nick} (${positionInfo}) - Was ${playerData.status}, now active`);
-            
-            const currentPlayers = await fetchCurrentLeaderboard();
-            const isOnLeaderboard = currentPlayers && currentPlayers.some(cp => cp.userId === player.userId);
-            
-            const eventKeySuffix = playerData.status === 'banned' ? 'unban' : 'unsuspend';
-            const unbanKey = `${player.userId}_${eventKeySuffix}`;
-            
-            if (!data.eventCache.currentCheckUnbans[unbanKey]) {
-              data.eventCache.currentCheckUnbans[unbanKey] = true;
-              
-              if (playerData.status === 'banned') {
-                const mockPlayer = {
-                  userId: player.userId,
-                  nick: player.nick,
-                  position: lastRating ? lastRating.position : 'N/A',
-                  rating: lastRating ? lastRating.rating : 'N/A'
-                };
-                await sendUnbanNotification(mockPlayer, playerData);
-                console.log(`UNBANNED: ${player.nick} notification sent.`);
-                playerData.unbannedAt = currentTime;
-              } else {
-                console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
-                playerData.unsuspendedAt = currentTime;
-              }
-              
-              const mockPlayerForCSV = {
-                userId: player.userId,
-                nick: player.nick,
-                position: lastRating ? lastRating.position : 'N/A',
-                rating: lastRating ? lastRating.rating : 'N/A',
-                countryCode: player.countryCode
-              };
-              addToUnbannedUnsuspendedCSV(mockPlayerForCSV, playerData);
-              
-              playerData.status = 'active';
-              delete playerData.suspendedUntil;
-              delete playerData.suspendedAt;
-            }
-          } else {
-            console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ No longer sanctioned: ${player.nick} (${positionInfo}) - Was ${playerData.status}`);
-          }
-          return null;
+          console.log(`[${processedCount}/${sanctionedPlayers.length}] ✅ NO LONGER SANCTIONED: ${player.nick} (${positionInfo}) - Was ${player.status}`);
+          
+          return {
+            userId: player.userId,
+            nick: player.nick,
+            countryCode: player.countryCode,
+            confirmedBanned: false,
+            suspended: false,
+            deletedAccount: false,
+            lastRating: lastRating || { rating: 'N/A', position: 'N/A' },
+            isUnsuspension: true,
+            previousStatus: player.status
+          };
         }
         
         if (hasRealStatusChange) {
@@ -751,7 +756,6 @@ async function checkForBannedPlayers() {
     }
     
     const currentPlayerIds = new Set();
-    
     const missingPlayers = [];
     const sixHourAgo = currentTime - (6 * 60 * 60 * 1000);
 
@@ -826,6 +830,68 @@ async function checkForBannedPlayers() {
       }
     }
     
+    console.log('\nChecking sanctioned players for unsuspensions...');
+    
+    const sanctionedPlayers = [];
+    for (const [userId, playerData] of Object.entries(data.players)) {
+      if ((playerData.status === 'suspended' || playerData.status === 'banned') && 
+          playerData.status !== 'deleted_account') {
+        
+        sanctionedPlayers.push({
+          userId,
+          nick: playerData.nick,
+          countryCode: playerData.countryCode,
+          status: playerData.status,
+          suspendedUntil: playerData.suspendedUntil,
+          lastSeen: playerData.lastSeen,
+          ratings: playerData.ratings
+        });
+      }
+    }
+    
+    console.log(`Verifying ${sanctionedPlayers.length} sanctioned players...`);
+    
+    const unsuspensionResults = await verifyExistingSanctionedPlayers(sanctionedPlayers, data, currentTime);
+    
+    for (const result of unsuspensionResults) {
+      if (result && result.isUnsuspension) {
+        const playerData = data.players[result.userId];
+        const previousStatus = playerData.status;
+        
+        const eventKeySuffix = previousStatus === 'banned' ? 'unban' : 'unsuspend';
+        const unbanKey = `${result.userId}_${eventKeySuffix}`;
+        
+        if (!data.eventCache.currentCheckUnbans[unbanKey]) {
+          console.log(`✅ UNSANCTIONED: ${result.nick} - Was ${previousStatus}, now active`);
+          data.eventCache.currentCheckUnbans[unbanKey] = true;
+          
+          const mockPlayer = {
+            userId: result.userId,
+            nick: result.nick,
+            position: result.lastRating ? result.lastRating.position : 'N/A',
+            rating: result.lastRating ? result.lastRating.rating : 'N/A',
+            countryCode: result.countryCode
+          };
+          
+          if (previousStatus === 'banned') {
+            await sendUnbanNotification(mockPlayer, playerData);
+            console.log(`UNBANNED: ${result.nick} notification sent.`);
+            playerData.unbannedAt = currentTime;
+          } else {
+            await sendUnsuspendNotification(mockPlayer, playerData);
+            console.log(`UNSUSPENDED: ${result.nick} notification sent.`);
+            playerData.unsuspendedAt = currentTime;
+          }
+          
+          addToUnbannedUnsuspendedCSV(mockPlayer, playerData);
+          
+          playerData.status = 'active';
+          delete playerData.suspendedUntil;
+          delete playerData.suspendedAt;
+        }
+      }
+    }
+    
     console.log(`\nFetching API status for all ${currentPlayers.length} top 2000 players...`);
     const top2000ApiSanctionInfo = await verifyAllTop2000Players(currentPlayers, data, currentTime);
 
@@ -844,109 +910,118 @@ async function checkForBannedPlayers() {
         console.log(`New player tracked: ${player.nick} (#${player.position})`);
       } else {
         const playerData = data.players[player.userId];
-        playerData.nick = player.nick;
+        
+        if (playerData.nick !== player.nick) {
+          const isValidChange = checkNicknameChange(player.userId, playerData.nick, player.nick, playerData);
+          if (isValidChange) {
+            playerData.nick = normalizeUnicode(player.nick);
+          }
+        }
+        
         playerData.lastSeen = currentTime;
 
         const apiSanction = top2000ApiSanctionInfo.find(s => s && s.userId === player.userId);
         const alreadyProcessedByPriority = priorityBannedPlayers.some(p => p && p.userId === player.userId);
 
         if (apiSanction && !alreadyProcessedByPriority) {
-            if (apiSanction.isNewSanction) {
-                console.log(`[STATUS UPDATE] New sanction for ${player.nick}. Bot status changing from ${playerData.status}.`);
-                if (apiSanction.confirmedBanned) {
-                    playerData.status = 'banned';
-                    playerData.bannedAt = playerData.bannedAt || currentTime;
-                    delete playerData.suspendedUntil;
-                    delete playerData.suspendedAt;
-                } else {
-                    playerData.status = 'suspended';
-                    playerData.suspendedAt = playerData.suspendedAt || currentTime;
-                    playerData.suspendedUntil = apiSanction.suspendedUntil;
-                }
+          if (apiSanction.isNewSanction) {
+            console.log(`[STATUS UPDATE] New sanction for ${player.nick}. Bot status changing from ${playerData.status}.`);
+            if (apiSanction.confirmedBanned) {
+              playerData.status = 'banned';
+              playerData.bannedAt = playerData.bannedAt || currentTime;
+              delete playerData.suspendedUntil;
+              delete playerData.suspendedAt;
             } else {
-                if (playerData.status === 'active') {
-                    console.warn(`[DATA CORRECTION] ${player.nick} is sanctioned by API (${apiSanction.confirmedBanned ? 'banned' : 'suspended'}) but bot thought 'active'. Correcting status.`);
-                    if (apiSanction.confirmedBanned) {
-                        playerData.status = 'banned';
-                        playerData.bannedAt = playerData.bannedAt || currentTime;
-                    } else {
-                        playerData.status = 'suspended';
-                        playerData.suspendedAt = playerData.suspendedAt || currentTime;
-                        playerData.suspendedUntil = apiSanction.suspendedUntil;
-                    }
-                }
+              playerData.status = 'suspended';
+              playerData.suspendedAt = playerData.suspendedAt || currentTime;
+              playerData.suspendedUntil = apiSanction.suspendedUntil;
             }
+          } else {
+            if (playerData.status === 'active') {
+              console.warn(`[DATA CORRECTION] ${player.nick} is sanctioned by API (${apiSanction.confirmedBanned ? 'banned' : 'suspended'}) but bot thought 'active'. Correcting status.`);
+              if (apiSanction.confirmedBanned) {
+                playerData.status = 'banned';
+                playerData.bannedAt = playerData.bannedAt || currentTime;
+              } else {
+                playerData.status = 'suspended';
+                playerData.suspendedAt = playerData.suspendedAt || currentTime;
+                playerData.suspendedUntil = apiSanction.suspendedUntil;
+              }
+            }
+          }
         } else if (!alreadyProcessedByPriority) { 
-            if ((playerData.status === 'banned' || playerData.status === 'suspended' || playerData.status === 'suspension_expired') && 
-                playerData.status !== 'deleted_account' &&
-                !isFirstCheckAfterRestart) {
-                
-                const previousStatus = playerData.status;
-                const eventKeySuffix = previousStatus === 'banned' ? 'unban' : 'unsuspend';
-                const unbanKey = `${player.userId}_${eventKeySuffix}`;
+          if ((playerData.status === 'banned' || playerData.status === 'suspended' || playerData.status === 'suspension_expired') && 
+              playerData.status !== 'deleted_account' &&
+              !isFirstCheckAfterRestart) {
+            
+            const previousStatus = playerData.status;
+            const eventKeySuffix = previousStatus === 'banned' ? 'unban' : 'unsuspend';
+            const unbanKey = `${player.userId}_${eventKeySuffix}`;
 
-                if (!data.eventCache.currentCheckUnbans[unbanKey]) {
-                    console.log(`Player ${player.nick} is active on API & leaderboard. Previous bot status: ${previousStatus}.`);
-                    data.eventCache.currentCheckUnbans[unbanKey] = true;
+            if (!data.eventCache.currentCheckUnbans[unbanKey]) {
+              console.log(`✅ BACK ON LEADERBOARD: ${player.nick} - Was ${previousStatus}, now active`);
+              data.eventCache.currentCheckUnbans[unbanKey] = true;
 
-                    if (previousStatus === 'banned') {
-                        await sendUnbanNotification(player, playerData);
-                        console.log(`UNBANNED: ${player.nick} notification sent.`);
-                        playerData.unbannedAt = currentTime;
-                    } else {
-                        console.log(`UNSUSPENDED (no Discord notification): ${player.nick} is back.`);
-                        playerData.unsuspendedAt = currentTime;
-                    }
-                    addToUnbannedUnsuspendedCSV(player, playerData);
+              if (previousStatus === 'banned') {
+                await sendUnbanNotification(player, playerData);
+                console.log(`UNBANNED: ${player.nick} notification sent.`);
+                playerData.unbannedAt = currentTime;
+              } else {
+                await sendUnsuspendNotification(player, playerData);
+                console.log(`UNSUSPENDED: ${player.nick} notification sent.`);
+                playerData.unsuspendedAt = currentTime;
+              }
+              
+              addToUnbannedUnsuspendedCSV(player, playerData);
 
-                    playerData.status = 'active';
-                }
-            } else if (playerData.status !== 'active' && playerData.status !== 'deleted_account') {
-                if (isFirstCheckAfterRestart || playerData.status === 'suspension_expired') {
-                    console.log(`[SILENT UPDATE] ${player.nick} from ${playerData.status} to active. API reports active.`);
-                }
-                playerData.status = 'active';
+              playerData.status = 'active';
+              delete playerData.suspendedUntil;
+              delete playerData.suspendedAt;
             }
+          } else if (playerData.status !== 'active' && playerData.status !== 'deleted_account') {
+            if (isFirstCheckAfterRestart || playerData.status === 'suspension_expired') {
+              console.log(`[SILENT UPDATE] ${player.nick} from ${playerData.status} to active. API reports active.`);
+            }
+            playerData.status = 'active';
+          }
         }
         
         playerData.ratings.push({
-            rating: player.rating,
-            position: player.position,
-            timestamp: currentTime
+          rating: player.rating,
+          position: player.position,
+          timestamp: currentTime
         });
         
         if (playerData.ratings.length > 30) {
-            playerData.ratings = playerData.ratings.slice(-30);
+          playerData.ratings = playerData.ratings.slice(-30);
         }
       }
     }
     
     if (isFirstCheckAfterRestart) {
-        console.log('🔄 First check after restart - skipping unban notifications to avoid false positives');
-        await sendStatusMessage('Bot restarted - status updated silently to avoid false unban notifications');
+      console.log('🔄 First check after restart - skipping unban notifications to avoid false positives');
     }
     
     for (const [userId, playerData] of Object.entries(data.players)) {
-        if (playerData.status === 'suspended' && 
-            playerData.suspendedUntil && 
-            currentTime >= new Date(playerData.suspendedUntil).getTime()) {
-            
-            console.log(`SUSPENSION EXPIRED: ${playerData.nick} suspension has naturally expired`);
-            playerData.status = 'suspension_expired';
-            delete playerData.suspendedUntil;
-            delete playerData.suspendedAt;
-        }
+      if (playerData.status === 'suspended' && 
+          playerData.suspendedUntil && 
+          currentTime >= new Date(playerData.suspendedUntil).getTime()) {
+        
+        console.log(`SUSPENSION EXPIRED: ${playerData.nick} suspension has naturally expired`);
+        playerData.status = 'suspension_expired';
+        delete playerData.suspendedUntil;
+        delete playerData.suspendedAt;
+      }
     }
     
-    console.log('\nChecking existing suspended/banned players for status changes...');
-    const existingSanctionedPlayers = [];
-
+    const remainingSanctionedPlayers = [];
     for (const [userId, playerData] of Object.entries(data.players)) {
       if ((playerData.status === 'suspended' || playerData.status === 'banned') && 
           playerData.status !== 'deleted_account' &&
-          playerData.lastSeen > currentTime - (7 * 24 * 60 * 60 * 1000)) {
+          playerData.lastSeen > currentTime - (7 * 24 * 60 * 60 * 1000) &&
+          !sanctionedPlayers.some(sp => sp.userId === userId)) {
         
-        existingSanctionedPlayers.push({
+        remainingSanctionedPlayers.push({
           userId,
           nick: playerData.nick,
           countryCode: playerData.countryCode,
@@ -958,17 +1033,15 @@ async function checkForBannedPlayers() {
       }
     }
 
-    console.log(`Found ${existingSanctionedPlayers.length} existing sanctioned players to verify`);
-    const existingSanctionedApiInfo = existingSanctionedPlayers.length > 0 ?
-      await verifyExistingSanctionedPlayers(existingSanctionedPlayers, data, currentTime) : [];
+    console.log(`Found ${remainingSanctionedPlayers.length} remaining sanctioned players to verify`);
+    const remainingSanctionedApiInfo = remainingSanctionedPlayers.length > 0 ?
+      await verifyExistingSanctionedPlayers(remainingSanctionedPlayers, data, currentTime) : [];
     
-    const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...existingSanctionedApiInfo].filter(s => s !== null);
+    const allSanctionsFromApi = [...top2000ApiSanctionInfo, ...remainingSanctionedApiInfo, ...unsuspensionResults].filter(s => s !== null);
     const allDeletedAccounts = allSanctionsFromApi.filter(s => s && s.deletedAccount && s.isNewDeletion);
     const allNewSanctionEvents = allSanctionsFromApi.filter(s => s && s.isNewSanction && !s.deletedAccount);
     
-    if (allNewSanctionEvents.length > 0) {
-      console.log(`\nProcessing ${allNewSanctionEvents.length} new/updated bans/suspensions for notification...`);
-      
+    if (allNewSanctionEvents.length > 0) {      
       await sendBanNotification(allNewSanctionEvents);
       
       for (const player of allNewSanctionEvents) {
@@ -981,16 +1054,16 @@ async function checkForBannedPlayers() {
           
           const pDataToUpdate = data.players[player.userId];
           if (pDataToUpdate) {
-              if (player.confirmedBanned) {
-                  if (pDataToUpdate.status !== 'banned') pDataToUpdate.bannedAt = currentTime;
-                  pDataToUpdate.status = 'banned';
-                  delete pDataToUpdate.suspendedUntil; 
-                  delete pDataToUpdate.suspendedAt;
-              } else if (player.suspended) {
-                  if (pDataToUpdate.status !== 'suspended' || pDataToUpdate.suspendedUntil !== player.suspendedUntil) pDataToUpdate.suspendedAt = currentTime;
-                  pDataToUpdate.status = 'suspended';
-                  pDataToUpdate.suspendedUntil = player.suspendedUntil;
-              }
+            if (player.confirmedBanned) {
+              if (pDataToUpdate.status !== 'banned') pDataToUpdate.bannedAt = currentTime;
+              pDataToUpdate.status = 'banned';
+              delete pDataToUpdate.suspendedUntil; 
+              delete pDataToUpdate.suspendedAt;
+            } else if (player.suspended) {
+              if (pDataToUpdate.status !== 'suspended' || pDataToUpdate.suspendedUntil !== player.suspendedUntil) pDataToUpdate.suspendedAt = currentTime;
+              pDataToUpdate.status = 'suspended';
+              pDataToUpdate.suspendedUntil = player.suspendedUntil;
+            }
           }
         }
       }
@@ -1178,6 +1251,74 @@ async function verifyBannedPlayers(missingPlayers, data, currentTime) {
   return bannedPlayers;
 }
 
+function normalizeUnicode(str) {
+  if (!str || typeof str !== 'string') return str;
+  
+  return str.normalize('NFC');
+}
+
+function isValidNicknameChange(oldNick, newNick) {
+  if (!oldNick || !newNick) return false;
+  
+  const hasReplacementChars = /�/.test(oldNick) || /�/.test(newNick);
+  if (hasReplacementChars) {
+    console.log(`⚠️ Detected replacement characters in nickname change: "${oldNick}" -> "${newNick}"`);
+    return false;
+  }
+  
+  const normalizedOld = normalizeUnicode(oldNick);
+  const normalizedNew = normalizeUnicode(newNick);
+  
+  if (normalizedOld === normalizedNew) {
+    return false;
+  }
+  
+  return true;
+}
+
+function checkNicknameChange(userId, storedNick, currentNick, playerData) {
+  if (!currentNick || currentNick === 'Unknown') {
+    return false;
+  }
+  
+  if (detectFalseNicknameChange(storedNick, currentNick)) {
+    return false;
+  }
+  
+  const normalizedStored = normalizeUnicode(storedNick);
+  const normalizedCurrent = normalizeUnicode(currentNick);
+  
+  if (normalizedStored !== normalizedCurrent && isValidNicknameChange(storedNick, currentNick)) {
+    sendNicknameChangeNotification(userId, storedNick, currentNick, playerData);
+    return true;
+  }
+  
+  return false;
+}
+
+function detectFalseNicknameChange(oldNick, newNick) {
+  if (!oldNick || !newNick) return false;
+  
+  const oldHasReplacement = /�/.test(oldNick);
+  const newHasReplacement = /�/.test(newNick);
+  
+  if (oldHasReplacement || newHasReplacement) {
+    const oldCleaned = oldNick.replace(/�+/g, '');
+    const newCleaned = newNick.replace(/�+/g, '');
+    
+    if (oldCleaned === newCleaned && oldCleaned.length > 0) {
+      return true;
+    }
+  }
+  const normalizedOld = normalizeUnicode(oldNick);
+  const normalizedNew = normalizeUnicode(newNick);
+  
+  if (normalizedOld === normalizedNew) {
+    return true;
+  }
+  
+  return false;
+}
 
 async function sendUnbanNotification(player, playerData) {
   try {
@@ -1348,6 +1489,53 @@ async function sendDeletedAccountNotification(deletedPlayers) {
   }
 }
 
+async function sendUnsuspendNotification(player, playerData) {
+  try {
+    const channel = await client.channels.fetch(unsuspended_channel_id);
+    
+    const embed = new EmbedBuilder()
+      .setTitle('🟢 Player Unsuspended')
+      .setColor(0x00FF00)
+      .setDescription(`**${player.nick}** has been unsuspended`)
+      .addFields(
+        { name: 'Position', value: `#${player.position}`, inline: true },
+        { name: 'ELO', value: `${player.rating}`, inline: true },
+        { name: 'Country', value: getCountryFlag(player.countryCode), inline: true },
+        { name: 'Profile', value: `[View Profile](https://www.geoguessr.com/user/${player.userId})`, inline: false }
+      )
+      .setTimestamp();
+    
+    await channel.send({ embeds: [embed] });
+    console.log(`Unsuspend notification sent for ${player.nick}`);
+  } catch (error) {
+    console.error('Error sending unsuspend notification:', error);
+  }
+}
+
+async function sendNicknameChangeNotification(userId, oldNick, newNick, playerData) {
+  try {
+    const channel = await client.channels.fetch(NICKNAME_CHANGE_CHANNEL);
+    const flag = getCountryFlag(playerData.countryCode);
+    
+    const embed = new EmbedBuilder()
+      .setTitle('<:exclamation:1393328259285909705> Nickname Change Detected <:exclamation:1393328259285909705>')
+      .setColor(0x3498DB)
+      .addFields(
+        { name: 'Old Nickname', value: `${oldNick}`, inline: true },
+        { name: 'New Nickname', value: `${newNick}`, inline: true },
+        { name: 'Country', value: `${flag}`, inline: true },
+        { name: 'Profile', value: `[View Profile](https://www.geoguessr.com/user/${userId})`, inline: false }
+      )
+      .setTimestamp()
+      .setFooter({ text: 'GeoGuessr Tracker' });
+    
+    await channel.send({ embeds: [embed] });
+    console.log(`Nickname change notification sent for ${oldNick} -> ${newNick}`);
+  } catch (error) {
+    console.error('Error sending nickname change notification:', error);
+  }
+}
+
 function startAutomaticChecking() {
   console.log('Starting automatic checking every hour...');
   
@@ -1358,7 +1546,6 @@ function startAutomaticChecking() {
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
-  console.log(`Monitoring top 2000 players only`);
   
   initializeCSVFiles();
   startAutomaticChecking();
